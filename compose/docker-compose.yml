@@ -1,0 +1,148 @@
+# The built-in-Airflow stack: Fabric's control plane, and the Airflow it hosts.
+#
+# WHAT IS DELIBERATELY ABSENT compared with fabric-platform-airflow3: an Airflow
+# of this platform's own. There, the platform runs the scheduler and mounts the
+# product as a DAG bundle. Here the scheduler is FABRIC'S -- it ships inside the
+# emulator behind `ApacheAirflowJob` items, the same way Sail is what a Fabric
+# Spark pool actually is. A platform that started its own Airflow would be
+# demonstrating the other cell.
+#
+# THE SIDECAR IS DECLARED HERE, pinned, exactly as the sibling platform declares
+# Sail and the Spark agent. It is infrastructure this platform stands up, not
+# something it can borrow: the emulator's own compose lives in the emulator's
+# repository and a consumer cannot reach into it -- that would be the sibling
+# path every platform here is forbidden to have.
+#
+# The VERSION is not a choice, though. Microsoft supports exactly Airflow 2.10.5
+# on Python 3.12 for Apache Airflow jobs, and `AIRFLOW__CORE__EXECUTOR` is on
+# the list of settings a Fabric user cannot override -- its value there is
+# CeleryExecutor. So these are copied from what Fabric documents rather than
+# picked, and `test_the_sidecar_matches_what_fabric_runs` holds them to it.
+# Sequential would serialise every parallel DAG while still passing, which is
+# the defect fabric-emulator#320 fixes on the emulator's own side.
+services:
+  entra-emulator:
+    image: ghcr.io/calvinchengx/entra-emulator:${ENTRA_EMULATOR_VERSION:?see versions.env}
+    environment:
+      ORIGIN_MODE: compat
+      TLS_ENABLED: "false"
+      PORT: "8443"
+      PUBLIC_ORIGIN: "http://entra-emulator:8443"
+    ports:
+      - "${ENTRA_PORT:-18443}:8443"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/entra-emulator", "healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+  fabric-emulator:
+    image: ghcr.io/calvinchengx/fabric-emulator:${FABRIC_EMULATOR_VERSION:?see versions.env}
+    depends_on:
+      entra-emulator:
+        condition: service_healthy
+    environment:
+      FABRIC_ADDR: ":9443"
+      FABRIC_ENTRA_ISSUER: "http://entra-emulator:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/v2.0"
+      # THE THREE THAT MAKE ApacheAirflowJob REAL. Without FABRIC_AIRFLOW_URL
+      # the Airflow routes answer `AirflowNotConfigured`, which is an honest
+      # "not wired up" rather than a hang -- and pointing it at a container
+      # nobody started is the bug the emulator's own comments warn about, which
+      # is why the sidecar profile and this URL travel together.
+      FABRIC_AIRFLOW_URL: "http://airflow:8080"
+      FABRIC_AIRFLOW_DAG_DIR: "/airflow-dags"
+      FABRIC_AIRFLOW_USERNAME: admin
+      FABRIC_AIRFLOW_PASSWORD: admin
+    ports:
+      - "${FABRIC_PORT:-19443}:9443"
+    volumes:
+      # SHARED WITH THE SIDECAR. The emulator writes DAG sources here and the
+      # scheduler reads them from the same place, so the sync is a file copy
+      # rather than an upload API -- which is also how Fabric describes it.
+      - airflow-dags:/airflow-dags
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/fabric-emulator", "healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+  # Fabric's built-in Airflow. Real upstream Airflow, because that is what
+  # Fabric's Apache Airflow job IS -- not an imitation of one.
+  airflow:
+    image: apache/airflow:${AIRFLOW_VERSION:?see versions.env}
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-broker:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Fabric's default, and the emulator's client unpauses before every
+      # trigger anyway.
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://airflow-broker:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-db/airflow
+      # The emulator writes a DAG and waits for the scheduler to notice it; the
+      # 5-minute defaults make that look like a hang.
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "2"
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "1"
+    volumes:
+      - airflow-dags:/opt/airflow/dags
+    ports:
+      - "${AIRFLOW_UI_PORT:-18085}:8080"
+    command:
+      - bash
+      - -ec
+      - |
+        # THE EMULATOR HAS TO BE ABLE TO WRITE HERE. It runs distroless as uid
+        # 65532; this volume comes up owned by airflow:root at 0775, so 65532
+        # matches neither owner nor group and gets r-x. SyncDAGs then fails
+        # with permission denied at RUN time -- and the emulator reports that
+        # as the generic `AirflowRunFailed`, so the symptom is a job that
+        # failed with no reason and an empty dags folder.
+        #
+        # The airflow user owns the directory, so it can widen it. Doing it
+        # here rather than in a separate init container keeps the stack to the
+        # services that mean something.
+        chmod 0777 /opt/airflow/dags
+        airflow db migrate
+        airflow users create --username admin --password admin \
+          --firstname Fabric --lastname Emulator --role Admin --email admin@example.com
+        airflow scheduler &
+        airflow celery worker &
+        exec airflow webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  # A parallel executor needs concurrent writers; SQLite answers
+  # `database is locked`, so the database is not a separable choice.
+  airflow-db:
+    image: postgres:${POSTGRES_VERSION:?see versions.env}
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # The queue between scheduler and worker: the part that makes the executor
+  # Celery rather than Local.
+  airflow-broker:
+    image: redis:${REDIS_VERSION:?see versions.env}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  airflow-dags:
