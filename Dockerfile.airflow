@@ -1,0 +1,31 @@
+# Fabric's built-in Airflow, carrying the product's dependencies.
+#
+# THIS IS A WORKAROUND FOR A GAP, and it should say so. Real Fabric lets an
+# Apache Airflow job install requirements ("install private package as
+# requirement" in Microsoft's own feature table); the emulator syncs `.py`
+# files and nothing else, so there is no way to get `deltalake` or `pyarrow`
+# into the scheduler through the Fabric API. Baking them into the image
+# reaches the same end state by a different road, and the difference is
+# recorded rather than papered over -- see fabric-emulator's requirements gap.
+#
+# IT NAMES NO PACKAGE. Whatever the product's pyproject.toml declares is what
+# gets installed, exactly as fabric-platform-airflow3's worker image does.
+#
+# DEPENDENCIES ONLY, and this is where it DIVERGES from that sibling, on
+# purpose. There the product is installed as a project because the DAG bundle
+# imports the product's own package; here the DAG is not imported at all -- it
+# is PUT into an ApacheAirflowJob as item files and Fabric syncs it to the
+# scheduler. So the product's package is never on the worker's path and
+# installing it would suggest a delivery mechanism this cell does not use.
+# If a leaf here ever ships importable code, this is the line to revisit.
+ARG AIRFLOW_VERSION=2.10.5-python3.12
+FROM apache/airflow:${AIRFLOW_VERSION}
+ARG PRODUCT_DIR=product
+COPY --chown=airflow ${PRODUCT_DIR}/pyproject.toml /opt/build/pyproject.toml
+# --python, NOT --system. The image runs as the `airflow` user and its
+# interpreter lives in /home/airflow/.local; `--system` targets /usr/local,
+# which that user cannot write -- the build fails on `Permission denied`
+# creating a package directory, which reads like a broken wheel rather than a
+# wrong target. uv is already in the image, so it is not installed again.
+RUN uv pip install --python /home/airflow/.local/bin/python \
+      -r /opt/build/pyproject.toml

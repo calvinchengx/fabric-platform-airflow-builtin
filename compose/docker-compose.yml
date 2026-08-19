@@ -69,7 +69,16 @@ services:
   # Fabric's built-in Airflow. Real upstream Airflow, because that is what
   # Fabric's Apache Airflow job IS -- not an imitation of one.
   airflow:
-    image: apache/airflow:${AIRFLOW_VERSION:?see versions.env}
+    # BUILT, not pulled: the product's dependencies have to be in the image
+    # because the emulator has no requirements mechanism (real Fabric does).
+    # The base tag is still the pin -- Fabric supports exactly this version.
+    build:
+      context: ${PRODUCT:?set PRODUCT=/path/to/a/product}/..
+      dockerfile: ${PWD}/Dockerfile.airflow
+      args:
+        AIRFLOW_VERSION: ${AIRFLOW_VERSION:?see versions.env}
+        PRODUCT_DIR: ${PRODUCT_NAME:?set by the Makefile}
+    image: contoso-fabric-builtin-airflow:${AIRFLOW_VERSION:?see versions.env}
     depends_on:
       airflow-db:
         condition: service_healthy
@@ -89,6 +98,12 @@ services:
       # 5-minute defaults make that look like a hang.
       AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "2"
       AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "1"
+      # WHAT THE PRODUCT'S DAG READS. The platform supplies the vendor's
+      # address and credential; the DAG names neither. In production these are
+      # the real vendor's hostname and a secret from a vault, which is the only
+      # thing that changes.
+      CONTOSO_POS_API: "http://contoso-pos:8090"
+      CONTOSO_POS_API_KEY: "${CONTOSO_POS_API_KEY:?the vendor's key -- make reads it from the sources fixture}"
     volumes:
       - airflow-dags:/opt/airflow/dags
     ports:
@@ -143,6 +158,34 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # ---- The vendor -----------------------------------------------------------
+  # Contoso POS, from `contoso-sources` -- the same declaration and the same
+  # fixture bytes every other cell pulls from, which is the only reason gold
+  # numbers can be compared across the family at all. This platform mounts what
+  # that repository materialises; it does not carry a copy.
+  #
+  # ONE VENDOR, because this cell is proving an ORCHESTRATOR, not an ingest.
+  # The Airflow 3 cell already witnesses all four. When this DAG widens to the
+  # medallion the other three come with it, generated from sources.yaml rather
+  # than hand-written here.
+  contoso-pos:
+    image: mokapi/mokapi:${MOKAPI_VERSION:?see versions.env}
+    command:
+      # The dashboard keeps every request AND its response body in memory; for
+      # a 95 MB export that is a multi-hundred-MB copy per call.
+      - --event-store-default-size=1
+      - /sources/contoso-pos/openapi.yaml
+      - /sources/contoso-pos/serve.js
+    environment:
+      # Go does not read the cgroup limit, so without this the heap climbs past
+      # mem_limit and the container is killed mid-response.
+      GOMEMLIMIT: 2GiB
+    mem_limit: 4g
+    volumes:
+      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
+    expose:
+      - "8090"
 
 volumes:
   airflow-dags:
