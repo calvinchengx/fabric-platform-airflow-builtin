@@ -44,6 +44,10 @@ services:
     environment:
       FABRIC_ADDR: ":9443"
       FABRIC_ENTRA_ISSUER: "http://entra-emulator:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/v2.0"
+      # The emulator writes its self-signed cert here, on a volume, so every
+      # client in the stack can trust the SAME file rather than each disabling
+      # verification.
+      FABRIC_DATA_DIR: "/data"
       # THE THREE THAT MAKE ApacheAirflowJob REAL. Without FABRIC_AIRFLOW_URL
       # the Airflow routes answer `AirflowNotConfigured`, which is an honest
       # "not wired up" rather than a hang -- and pointing it at a container
@@ -53,6 +57,9 @@ services:
       FABRIC_AIRFLOW_DAG_DIR: "/airflow-dags"
       FABRIC_AIRFLOW_USERNAME: admin
       FABRIC_AIRFLOW_PASSWORD: admin
+      # Where Livy sessions execute. Fabric terminates Livy and the engine does
+      # the compute; without this the Spark routes are an honest 501.
+      FABRIC_SPARK_AGENT_URL: "http://spark-agent:8099"
     ports:
       - "${FABRIC_PORT:-19443}:9443"
     networks:
@@ -74,6 +81,7 @@ services:
       # scheduler reads them from the same place, so the sync is a file copy
       # rather than an upload API -- which is also how Fabric describes it.
       - airflow-dags:/airflow-dags
+      - emu-data:/data
     healthcheck:
       test: ["CMD", "/usr/local/bin/fabric-emulator", "healthcheck"]
       interval: 3s
@@ -122,6 +130,8 @@ services:
       # Supplied by the platform because they are deployment facts: in
       # production these are a real tenant, a real service principal and real
       # OneLake. The DAG reads them and branches on none of them.
+      SSL_CERT_FILE: "/tmp/ca-bundle.pem"
+      REQUESTS_CA_BUNDLE: "/tmp/ca-bundle.pem"
       FABRIC_API_ROOT: "https://api.fabric.microsoft.com:9443"
       FABRIC_ONELAKE_HOST: "onelake.dfs.fabric.microsoft.com"
       ENTRA_TOKEN_URL: "http://entra-emulator:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/oauth2/v2.0/token"
@@ -136,6 +146,7 @@ services:
          "azure_allow_invalid_certificates": "true"}
     volumes:
       - airflow-dags:/opt/airflow/dags
+      - emu-data:/emu-data:ro
     ports:
       - "${AIRFLOW_UI_PORT:-18085}:8080"
     command:
@@ -153,11 +164,43 @@ services:
         # here rather than in a separate init container keeps the stack to the
         # services that mean something.
         chmod 0777 /opt/airflow/dags
+        # TRUST THE EMULATOR'S CERT, added to what is already trusted rather
+        # than substituted for it. dbt-fabricspark opens the Livy session with
+        # its own `requests` client, which verifies -- and unlike this DAG's
+        # own calls there is no `verify=False` seam to reach. Without this the
+        # failure is `Max retries exceeded` against api.fabric.microsoft.com,
+        # which names neither TLS nor the certificate.
+        #
+        # APPENDED, because replacing the store breaks everything else: dbt
+        # reaching hub.getdbt.com then fails with CERTIFICATE_VERIFY_FAILED.
+        if [ -f /emu-data/tls/cert.pem ]; then
+          python3 - <<'CAEOF'
+        import pathlib, ssl
+        out = pathlib.Path("/tmp/ca-bundle.pem")
+        emulator = pathlib.Path("/emu-data/tls/cert.pem").read_text()
+        try:
+            import certifi
+            system = pathlib.Path(certifi.where()).read_text()
+        except Exception:
+            default = ssl.get_default_verify_paths().cafile
+            system = pathlib.Path(default).read_text() if default else ""
+        out.write_text(system + "\n" + emulator)
+        print("trust bundle: system CAs + emulator cert ->", out)
+        CAEOF
+        fi
         airflow db migrate
         airflow users create --username admin --password admin \
           --firstname Fabric --lastname Emulator --role Admin --email admin@example.com
         airflow scheduler &
-        airflow celery worker &
+        # --hostname EXPLICITLY. Without it this combination of celery 5.4
+        # and apache-airflow-providers-celery resolves the worker's node name
+        # to None and the worker dies at startup with
+        # `AttributeError: 'NoneType' object has no attribute 'split'` -- while
+        # the scheduler keeps running, so the symptom is tasks that sit in
+        # `queued` forever rather than an error anyone sees. Measured after the
+        # image gained the product's dependencies; the stock image happened to
+        # get a usable default.
+        airflow celery worker --celery-hostname "worker@%h" &
         exec airflow webserver
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
@@ -189,6 +232,40 @@ services:
       timeout: 3s
       retries: 20
 
+  # ---- The engine ----------------------------------------------------------
+  # Sail is what a Fabric Spark pool IS here: the emulator terminates Livy and
+  # this computes. Silver's dbt-fabricspark models are submitted over that
+  # Livy surface, so without an engine there is no silver -- only bronze.
+  #
+  # PINNED BY DIGEST as well as tag, matching the sibling platform. A tag can
+  # be moved; a digest is the image that was actually verified.
+  sail:
+    image: ghcr.io/calvinchengx/emulator-sail:${SAIL_ENGINE_VERSION:?see versions.env}@${SAIL_ENGINE_DIGEST:?see versions.env}
+    depends_on:
+      fabric-emulator: {condition: service_healthy}
+    environment:
+      ENTRA_TOKEN_URL: "http://entra-emulator:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/oauth2/v2.0/token"
+      ENTRA_CLIENT_ID: "00d88624-f0d7-46f6-a641-6232c2608928"
+      ENTRA_CLIENT_SECRET: "daemon-app-secret"
+      AZURE_STORAGE_ACCOUNT_NAME: "onelake"
+      AZURE_STORAGE_ENDPOINT: "https://api.fabric.microsoft.com:9443/onelake"
+      # The emulator's cert is self-signed and object_store has no CA bundle
+      # option; this is the documented seam for it.
+      AZURE_ALLOW_INVALID_CERTIFICATES: "true"
+      SAIL_SPARK__SESSION_TIMEOUT_SECS: "3600"
+
+  spark-agent:
+    image: ghcr.io/calvinchengx/emulator-spark-agent:${SPARK_CLIENT_VERSION:?see versions.env}@${SPARK_CLIENT_DIGEST:?see versions.env}
+    depends_on:
+      sail: {condition: service_started}
+    environment:
+      SPARK_REMOTE: "sc://sail:50051"
+      ENTRA_TOKEN_URL: "http://entra-emulator:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/oauth2/v2.0/token"
+      ENTRA_CLIENT_ID: "00d88624-f0d7-46f6-a641-6232c2608928"
+      ENTRA_CLIENT_SECRET: "daemon-app-secret"
+      AZURE_STORAGE_ENDPOINT: "https://api.fabric.microsoft.com:9443/onelake"
+      AZURE_ALLOW_INVALID_CERTIFICATES: "true"
+
   # ---- The vendor -----------------------------------------------------------
   # Contoso POS, from `contoso-sources` -- the same declaration and the same
   # fixture bytes every other cell pulls from, which is the only reason gold
@@ -219,3 +296,6 @@ services:
 
 volumes:
   airflow-dags:
+  # The emulator's data directory, shared read-only with the sidecar so every
+  # client trusts the same certificate file.
+  emu-data:

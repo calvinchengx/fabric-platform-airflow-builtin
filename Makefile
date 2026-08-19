@@ -27,7 +27,12 @@ help: ## This list
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | expand -t12
 
 up: ## Start Fabric's control plane and the Airflow it hosts
-	$(COMPOSE) up -d --wait
+	# --build, ALWAYS. The sidecar carries the product's dependencies, so a
+	# product that adds one and a platform that reuses a cached image disagree
+	# silently: the DAG imports something the image does not have and fails at
+	# run time with ModuleNotFoundError, three steps from the pyproject.toml
+	# that changed. Measured -- adding contoso-data-product did exactly this.
+	$(COMPOSE) up -d --wait --build
 	@echo "platform: Airflow UI on http://localhost:$${AIRFLOW_UI_PORT:-18085}"
 
 down: ## Stop and remove everything, volumes included
