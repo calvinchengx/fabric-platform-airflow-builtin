@@ -133,6 +133,14 @@ services:
       # thing that changes.
       CONTOSO_POS_API: "http://contoso-pos:8090"
       CONTOSO_POS_API_KEY: "${CONTOSO_POS_API_KEY:?the vendor's key -- make reads it from the sources fixture}"
+      # EACH VENDOR'S OWN KEY, from each vendor's own fixture. A key that
+      # worked across vendors would prove nothing about any of them -- these
+      # are separate companies with separately rotating credentials, which is
+      # what having three vendors means rather than three routes on one.
+      CONTOSO_WEB_API: "http://contoso-web:8091"
+      CONTOSO_WEB_API_KEY: "${CONTOSO_WEB_API_KEY:?the vendor's key}"
+      CONTOSO_REFERENCE_API: "http://contoso-reference:8092"
+      CONTOSO_REFERENCE_API_KEY: "${CONTOSO_REFERENCE_API_KEY:?the vendor's key}"
       # HOW THE PRODUCT REACHES FABRIC from inside Fabric's own scheduler.
       # Supplied by the platform because they are deployment facts: in
       # production these are a real tenant, a real service principal and real
@@ -350,6 +358,47 @@ services:
       - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
     expose:
       - "8090"
+
+  # THE SECOND VENDOR, and the reason there is one. A platform that ingests a
+  # single source proves it can ingest a single source. Two is where the work
+  # starts: its own credential, JSON arrays where POS ships delimited text, and
+  # orders that arrive NESTED because a storefront thinks in baskets.
+  contoso-web:
+    image: mokapi/mokapi:${MOKAPI_VERSION:?see versions.env}
+    command:
+      - --event-store-default-size=1
+      - /sources/contoso-web/openapi.yaml
+      - /sources/contoso-web/serve.js
+    environment:
+      # The budget contoso-sources declares for THIS vendor -- smaller than
+      # POS's, because its whole export is 36 MB against POS's 170 MB. A
+      # memory budget is a fact about the vendor, not about whoever runs it.
+      GOMEMLIMIT: 1GiB
+    mem_limit: 2g
+    volumes:
+      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
+    expose:
+      - "8091"
+
+  # THE THIRD VENDOR, and the first that is not an operational system. The
+  # group data office publishes what the others are reported against. It is
+  # also the only one serving BINARY, so it is the only one whose transport can
+  # corrupt a payload while leaving it structurally valid -- which is why the
+  # product verifies the digest this vendor publishes.
+  contoso-reference:
+    image: mokapi/mokapi:${MOKAPI_VERSION:?see versions.env}
+    command:
+      - --event-store-default-size=1
+      - /sources/contoso-reference/openapi.yaml
+      - /sources/contoso-reference/serve.js
+    environment:
+      # Far lower: this vendor's entire export is about four kilobytes.
+      GOMEMLIMIT: 256MiB
+    mem_limit: 512m
+    volumes:
+      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
+    expose:
+      - "8092"
 
 volumes:
   airflow-dags:

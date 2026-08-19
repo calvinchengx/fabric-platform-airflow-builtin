@@ -18,8 +18,12 @@ export SOURCES_ABS := $(abspath $(SOURCES))
 # rather than written here: this platform stores no credential, and the value
 # is the vendor's to change.
 export CONTOSO_POS_API_KEY := $(shell cat $(SOURCES_ABS)/_data/contoso-pos/.api-key 2>/dev/null)
+export CONTOSO_WEB_API_KEY := $(shell cat $(SOURCES_ABS)/_data/contoso-web/.api-key 2>/dev/null)
+export CONTOSO_REFERENCE_API_KEY := $(shell cat $(SOURCES_ABS)/_data/contoso-reference/.api-key 2>/dev/null)
 COMPOSE := PRODUCT=$(PRODUCT_ABS) PRODUCT_NAME=$(PRODUCT_NAME) SOURCES=$(SOURCES_ABS) \
-           CONTOSO_POS_API_KEY=$(CONTOSO_POS_API_KEY) PWD=$(CURDIR) \
+           CONTOSO_POS_API_KEY=$(CONTOSO_POS_API_KEY) \
+           CONTOSO_WEB_API_KEY=$(CONTOSO_WEB_API_KEY) \
+           CONTOSO_REFERENCE_API_KEY=$(CONTOSO_REFERENCE_API_KEY) PWD=$(CURDIR) \
            docker compose -f compose/docker-compose.yml --env-file versions.env -p $(PROJECT)
 
 .PHONY: help up down witness test lint logs
