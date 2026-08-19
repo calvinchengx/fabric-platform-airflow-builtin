@@ -131,20 +131,75 @@ def test_an_unknown_job_status_is_not_treated_as_finished():
         assert f'"{state}"' in src
 
 
-def test_publishing_waits_for_the_scheduler_to_reread():
-    """A changed DAG published and triggered at once races re-serialisation.
+def test_publishing_does_not_sleep_before_running():
+    """The race this used to guard is not a race a consumer can close.
 
-    The run is created from whatever structure is currently serialised, so a
-    newly added task comes back `removed` and its downstream fails -- a run
-    that looks like a DAG bug and is not one. It happened twice before this
-    wait existed.
+    This platform slept 45 seconds between publishing a product's DAGs and
+    starting a Run, because a changed DAG triggered immediately came back as
+    the PREVIOUS version -- a run whose task instances belong to replaced code,
+    which reads as a DAG bug and is not one.
 
-    Asserted structurally because the failure only appears when a DAG CHANGES,
-    which no unit test can stage and a steady-state integration run never hits.
+    THE SLEEP WAS ON THE WRONG SIDE OF THE PROBLEM and could never have worked.
+    `PUT .../files` only stores bytes on the item; the write into the
+    scheduler's DAG folder happens in the emulator's Run handler, immediately
+    before it triggers. Sleeping here sleeps before the files exist on disk at
+    all. The race is entirely inside the emulator, between its own sync and its
+    own trigger, and no amount of patience out here closes it.
+
+    It also explains why the number kept moving. 15 seconds let four stale runs
+    through and 45 appeared to fix it; both were guesses either side of
+    Airflow's `min_serialized_dag_update_interval` (30s), which nobody had
+    identified. A parse can read a file and skip rewriting the serialised DAG,
+    and task instances come from that serialisation.
+
+    Closed in fabric-emulator v0.31.0, which reads the DAG's task set before
+    syncing and waits for it to change -- so this platform waits for nothing,
+    and a sleep reappearing here would be someone re-deriving a workaround for
+    a defect that is fixed.
     """
+    import ast
+
     src = (ROOT / "platform" / "airflowjob.py").read_text(encoding="utf-8")
-    assert "reparse" in src, "publish_dags must give the scheduler time to re-read"
-    assert "time.sleep(reparse)" in src
+    # SCOPED TO publish_dags. `run` sleeps too, between polls of a job it is
+    # waiting on, and that is a different thing entirely -- asserting against
+    # the whole module would forbid polling as well as guessing.
+    tree = ast.parse(src)
+    publish = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "publish_dags"
+    )
+    sleeps = [
+        node for node in ast.walk(publish)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "sleep"
+    ]
+    assert sleeps == [], (
+        "the publish-to-run race belongs to the emulator and is fixed there; "
+        "a sleep here buys nothing and hides that"
+    )
+    assert "reparse" not in ast.dump(publish)
+
+
+def test_the_emulator_is_pinned_past_the_publish_race():
+    """A platform that does not wait requires an emulator that does.
+
+    Dropping the sleep is only safe against an emulator carrying the fix. Below
+    v0.31.0 the trigger fires against whatever is serialised at that instant,
+    and this platform would publish a DAG and run its previous version --
+    silently, and green.
+    """
+    pins = (ROOT / "versions.env").read_text(encoding="utf-8")
+    line = next(
+        entry for entry in pins.splitlines()
+        if entry.startswith("FABRIC_EMULATOR_VERSION=")
+    )
+    version = line.split("=", 1)[1].strip()
+    major, minor, patch = (int(part) for part in version.split("."))
+    assert (major, minor, patch) >= (0, 31, 0), (
+        f"FABRIC_EMULATOR_VERSION={version} predates the publish-to-run fix; "
+        f"without the sleep this platform runs stale DAGs"
+    )
 
 
 def test_the_platform_declares_no_vendor_of_its_own():

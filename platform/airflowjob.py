@@ -63,7 +63,6 @@ def create(session: requests.Session, api: str, workspace: str, name: str) -> st
 
 def publish_dags(
     session: requests.Session, api: str, workspace: str, item: str, dags: pathlib.Path,
-    reparse: float = 45.0,
 ) -> list[str]:
     """PUT every .py under `dags/` into the item, and verify what landed.
 
@@ -105,34 +104,24 @@ def publish_dags(
             f"the item did not store what was sent: {missing} against {landed}"
         )
 
-    # LET THE SCHEDULER RE-READ BEFORE ANYONE TRIGGERS.
+    # NO WAIT HERE, DELIBERATELY, and it is not an omission.
     #
-    # Publishing a CHANGED DAG and starting it immediately races Fabric's
-    # scheduler: the run is created from whatever structure is currently
-    # serialised, and the new file is parsed a moment later. The result is not
-    # an error -- it is a run whose task instances belong to the previous
-    # version. Twice now: once a task that the trigger rule referenced had no
-    # instance at all, and once a newly added task came back in state
-    # `removed` while its downstream failed. Both read as DAG bugs and neither
-    # is one.
+    # This slept 45 seconds before returning, because a changed DAG published
+    # and triggered at once came back as the PREVIOUS version. The sleep was on
+    # the wrong side of the problem: `PUT .../files` only stores bytes on the
+    # item, and the write into the scheduler's DAG folder happens in the
+    # emulator's Run handler immediately before it triggers -- so this slept
+    # before the files existed on disk at all.
     #
-    # A WAIT, NOT A POLL, because there is nothing to poll. Fabric exposes the
-    # item and the job; whether its scheduler has re-serialised a DAG is not in
-    # that API, and reaching around it to Airflow's own endpoints would be
-    # asking a question production could not answer.
+    # The number kept moving because nobody had identified what it was racing.
+    # 15s let four stale runs through and 45s appeared to fix it; both sit
+    # either side of Airflow's `min_serialized_dag_update_interval` (30s), which
+    # lets a parse read a file and skip rewriting the serialised DAG that task
+    # instances actually come from.
     #
-    # 45s, AND THE NUMBER WAS EARNED. It was 15s first, sized for the
-    # scheduler's file re-scan window -- which is right for a CHANGED FILE and
-    # wrong for a CHANGED TOPOLOGY. Re-serialising a DAG whose task set or
-    # mapping changed takes longer, and 15s let three more stale runs through:
-    # a task added, a task turned into a mapped one, and another task added.
-    # Each looked like a DAG bug.
-    #
-    # This is a bound, not a measurement, and it is the honest weakness of the
-    # approach: too short and a structural change slips through, too long and
-    # every publish pays for it. It is generous because a stale run costs a
-    # whole cycle to diagnose and a slow one costs 45 seconds.
-    time.sleep(reparse)
+    # Closed in fabric-emulator v0.31.0, which reads the task set before syncing
+    # and waits for it to change. A sleep reappearing here would be a
+    # workaround re-derived for a defect that is fixed -- see the pin test.
     return sorted(sent)
 
 
