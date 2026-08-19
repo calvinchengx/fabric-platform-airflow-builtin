@@ -141,6 +141,13 @@ services:
       CONTOSO_WEB_API_KEY: "${CONTOSO_WEB_API_KEY:?the vendor's key}"
       CONTOSO_REFERENCE_API: "http://contoso-reference:8092"
       CONTOSO_REFERENCE_API_KEY: "${CONTOSO_REFERENCE_API_KEY:?the vendor's key}"
+      # The CDC vendor reaches the product as a BROKER and a DSN, not a base
+      # URL -- which is what having a change stream instead of an API means.
+      # The DSN carries the vendor's own dev credential, declared in
+      # contoso-sources; the product holds no default for it.
+      CONTOSO_ERP_BROKER: "contoso-erp-broker:9092"
+      CONTOSO_ERP_TOPIC: "contoso.erp.customer"
+      CONTOSO_ERP_DSN: "host=contoso-erp-db port=5432 dbname=erp user=contoso password=contoso-erp-dev"
       # HOW THE PRODUCT REACHES FABRIC from inside Fabric's own scheduler.
       # Supplied by the platform because they are deployment facts: in
       # production these are a real tenant, a real service principal and real
@@ -399,6 +406,119 @@ services:
       - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
     expose:
       - "8092"
+
+  # ---- The fourth vendor: a relational source, CAPTURED ---------------------
+  # THREE SERVICES, because a change stream needs all three and any two of them
+  # is a snapshot wearing a stream's name. The database holds the rows,
+  # Debezium reads its write-ahead log, and the broker carries what Debezium
+  # produced. Standing up only Postgres would serve rows -- possibly even the
+  # right count -- while testing something else entirely.
+  #
+  # This vendor exists so CDC and SCD2 are real rather than aspirational. A
+  # snapshot cannot say that a customer was in Germany BEFORE they were in
+  # France, and the fixture disagrees between capture order and business order
+  # on purpose, so a pipeline that sorts by the wrong one still gets the wrong
+  # answer. That is the lesson this vendor is here to teach.
+  contoso-erp-db:
+    image: postgres:${POSTGRES_VERSION:?see versions.env}
+    # wal_level=logical is not tuning. Without it Postgres emits no logical
+    # replication stream at all and Debezium fails at connector creation with
+    # a message about replication slots that does not name this setting.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+    environment:
+      POSTGRES_USER: contoso
+      POSTGRES_PASSWORD: contoso-erp-dev
+      POSTGRES_DB: erp
+    volumes:
+      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U contoso -d erp"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  contoso-erp-broker:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:?see versions.env}
+    # ONE LISTENER is enough here, unlike the platforms whose ingest runs on the
+    # host: this DAG consumes from inside the compose network, so there is no
+    # second address to advertise.
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --kafka-addr=INTERNAL://0.0.0.0:9092
+      - --advertise-kafka-addr=INTERNAL://contoso-erp-broker:9092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  contoso-erp-connect:
+    image: debezium/connect:${DEBEZIUM_VERSION:?see versions.env}
+    depends_on:
+      contoso-erp-db: {condition: service_healthy}
+      contoso-erp-broker: {condition: service_healthy}
+    environment:
+      BOOTSTRAP_SERVERS: "contoso-erp-broker:9092"
+      GROUP_ID: contoso_erp
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      # One partition each: ordering per key is what CDC guarantees, and more
+      # would trade that away for throughput this does not need.
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # THE SEEDER MAKES THE VENDOR EXIST. It registers the Debezium connector and
+  # THEN replays the fixture's history as real INSERT/UPDATE/DELETE, so the
+  # stream is CAPTURED rather than described. Landing a file that describes a
+  # change feed would be a different and much weaker claim.
+  #
+  # A step, not a service: `restart: no` and a one-shot command, because it
+  # must not loop if the replay fails.
+  contoso-erp-seed:
+    image: python:${PYTHON_VERSION:?see versions.env}-slim
+    depends_on:
+      contoso-erp-db: {condition: service_healthy}
+      contoso-erp-connect: {condition: service_healthy}
+    environment:
+      ERP_DSN: "host=contoso-erp-db port=5432 dbname=erp user=contoso password=contoso-erp-dev"
+      ERP_CONNECT_URL: "http://contoso-erp-connect:8083"
+      ERP_DB_HOST: contoso-erp-db
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:rw
+    working_dir: /sources
+    # --frozen --no-sync is load-bearing. A bare `uv run` RE-SYNCS and prunes
+    # anything absent from the lock, evicting the generators and psycopg
+    # installed moments earlier and then failing with ModuleNotFoundError for a
+    # package that was just there. psycopg goes in AFTER fixtures.py, because
+    # that script calls `uv sync` itself.
+    command:
+      - sh
+      - -c
+      - |
+        pip install --quiet uv &&
+        uv sync --quiet &&
+        uv run --frozen --no-sync python scripts/fixtures.py &&
+        uv pip install --quiet 'psycopg[binary]' &&
+        uv run --frozen --no-sync python scripts/seed_erp.py
+    restart: "no"
 
 volumes:
   airflow-dags:

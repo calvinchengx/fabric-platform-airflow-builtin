@@ -63,7 +63,7 @@ def create(session: requests.Session, api: str, workspace: str, name: str) -> st
 
 def publish_dags(
     session: requests.Session, api: str, workspace: str, item: str, dags: pathlib.Path,
-    reparse: float = 15.0,
+    reparse: float = 45.0,
 ) -> list[str]:
     """PUT every .py under `dags/` into the item, and verify what landed.
 
@@ -119,9 +119,19 @@ def publish_dags(
     # A WAIT, NOT A POLL, because there is nothing to poll. Fabric exposes the
     # item and the job; whether its scheduler has re-serialised a DAG is not in
     # that API, and reaching around it to Airflow's own endpoints would be
-    # asking a question production could not answer. The interval is the
-    # scheduler's own configured re-scan window plus margin, so it is bounded
-    # by a documented number rather than guessed.
+    # asking a question production could not answer.
+    #
+    # 45s, AND THE NUMBER WAS EARNED. It was 15s first, sized for the
+    # scheduler's file re-scan window -- which is right for a CHANGED FILE and
+    # wrong for a CHANGED TOPOLOGY. Re-serialising a DAG whose task set or
+    # mapping changed takes longer, and 15s let three more stale runs through:
+    # a task added, a task turned into a mapped one, and another task added.
+    # Each looked like a DAG bug.
+    #
+    # This is a bound, not a measurement, and it is the honest weakness of the
+    # approach: too short and a structural change slips through, too long and
+    # every publish pays for it. It is generous because a stale run costs a
+    # whole cycle to diagnose and a slow one costs 45 seconds.
     time.sleep(reparse)
     return sorted(sent)
 
