@@ -1,0 +1,131 @@
+# The platform carries no product, so its CI proves what it DOES own: the
+# vendor generator, the witness, and that the stack it describes is valid.
+#
+# This cell is the odd one in the family: the orchestrator is Fabric's own
+# built-in Airflow, so the platform bakes the product's dependencies into a
+# sidecar image rather than the emulator installing them. That difference is
+# the thing most likely to rot silently, which is why the tests run here.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.12.3"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # `--group dev`, not `--extra dev`: this repo declares its dev tools in
+      # [dependency-groups], and `uv sync --extra dev` is a hard error against
+      # that layout rather than a no-op.
+      - run: uv sync --group dev
+      - run: uv run pytest tests -q
+      - run: uv run ruff check .
+
+      - name: no test silently skipped
+        run: |
+          set -o pipefail
+          uv run pytest tests -q 2>&1 | tee /tmp/out
+          grep -qE "^[0-9]+ passed" /tmp/out
+          if grep -qE "[0-9]+ skipped" /tmp/out; then
+            echo "::error::a test skipped, CI must exercise the whole suite"
+            exit 1
+          fi
+
+  stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The generator splits its pins deliberately: PYTHON_VERSION is THIS
+      # platform's (the interpreter it runs a vendor's seed script with) and
+      # comes from ./versions.env, while the vendor image pins are the
+      # vendor's and come from the sources tree. The Makefile's `sources`
+      # target passes them exactly this way, so CI does too.
+      # The generator splits its pins deliberately: PYTHON_VERSION is THIS
+      # platform's (the interpreter it runs a vendor's seed script with) and
+      # comes from ./versions.env, while the vendor image pins are the
+      # vendor's and come from the sources tree. The Makefile's `sources`
+      # target passes them exactly this way, so CI does too.
+      #
+      # The fixture mirrors a real contoso-sources vendor rather than a
+      # minimal one, because this generator reads memory, mem_limit, health
+      # and the materialised .api-key, and a fixture missing any of them
+      # tests the error path instead of the happy one.
+      - name: the vendor generator refuses what it should
+        run: |
+          python3 -m py_compile scripts/sources.py scripts/witness.py
+          set -a; . ./versions.env; set +a
+
+          mkdir -p /tmp/src/_data/acme
+          cat > /tmp/src/sources.yaml <<'YAML'
+          version: 1
+          vendors:
+            - name: acme
+              conn: acme
+              kind: openapi
+              spec: acme/openapi.yaml
+              script: acme/serve.js
+              data: _data/acme
+              port: 8090
+              formats: [csv]
+              health: /api/v1/export/things
+              memory: 512MiB
+              mem_limit: 1g
+          YAML
+          # No de-indent step: the YAML block scalar already strips the common
+          # indentation, so the heredoc lands at column 0. The `sed -i` the
+          # sibling platforms carry here is a no-op on Linux and an error on
+          # BSD sed, which is what stopped this job being verifiable locally.
+          printf 'MOKAPI_VERSION=0.50.0\n' > /tmp/src/versions.env
+          printf 'test-key\n' > /tmp/src/_data/acme/.api-key
+
+          PYTHON_VERSION="$PYTHON_VERSION" python3 scripts/sources.py \
+            /tmp/src/sources.yaml /tmp/src > /tmp/frag.yml
+          python3 -c "import json; d=json.load(open('/tmp/frag.yml')); assert d['services'], d; print('services:', list(d['services']))"
+
+          # An unknown kind must be a hard error, not a quietly skipped vendor.
+          printf 'version: 1\nvendors:\n  - name: nope\n    kind: telepathy\n' > /tmp/src/bad.yaml
+          if PYTHON_VERSION="$PYTHON_VERSION" python3 scripts/sources.py /tmp/src/bad.yaml /tmp/src > /dev/null 2>&1; then
+            echo "::error::an unknown vendor kind was accepted"; exit 1
+          fi
+
+          # A cdc vendor whose pins the sources tree does not carry must be
+          # refused rather than guessed at.
+          printf 'version: 1\nvendors:\n  - name: erp\n    conn: erp\n    kind: cdc\n' > /tmp/src/cdc.yaml
+          if PYTHON_VERSION="$PYTHON_VERSION" python3 scripts/sources.py /tmp/src/cdc.yaml /tmp/src > /dev/null 2>&1; then
+            echo "::error::a cdc vendor was accepted with no POSTGRES/REDPANDA/DEBEZIUM pins"; exit 1
+          fi
+
+          # The interpreter pin is this platform's to supply: unset, the
+          # generator must refuse rather than pick one. This is the check the
+          # first version of this workflow tripped over.
+          if PYTHON_VERSION= python3 scripts/sources.py /tmp/src/sources.yaml /tmp/src > /dev/null 2>&1; then
+            echo "::error::the generator ran with no PYTHON_VERSION"; exit 1
+          fi
+
+      - name: the compose stack is well-formed
+        run: |
+          # The fragment is asserted non-empty FIRST. `docker compose config`
+          # accepts an empty override file and exits 0, so validating the
+          # stack without this would pass just as happily against a generator
+          # that produced nothing at all.
+          python3 -c "import json; d=json.load(open('/tmp/frag.yml')); assert len(d['services']) > 1, d"
+          mkdir -p /tmp/prod/dags
+          printf '[project]\nname = "p"\nversion = "0"\n\n[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n' > /tmp/prod/pyproject.toml
+          set -a; . ./versions.env; set +a
+          PRODUCT=/tmp/prod PRODUCT_NAME=prod SOURCES=/tmp/src \
+            docker compose -f compose/docker-compose.yml -f /tmp/frag.yml config -q
+          echo "compose config is valid"
