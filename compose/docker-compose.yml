@@ -41,6 +41,8 @@ services:
     depends_on:
       entra-emulator:
         condition: service_healthy
+      sqlserver:
+        condition: service_healthy
     environment:
       FABRIC_ADDR: ":9443"
       FABRIC_ENTRA_ISSUER: "http://entra-emulator:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/v2.0"
@@ -60,6 +62,11 @@ services:
       # Where Livy sessions execute. Fabric terminates Livy and the engine does
       # the compute; without this the Spark routes are an honest 501.
       FABRIC_SPARK_AGENT_URL: "http://spark-agent:8099"
+      # GOLD IS A WAREHOUSE, and a Warehouse is T-SQL over TDS. The emulator
+      # terminates the TDS protocol on 1433 and SQL Server executes behind it,
+      # exactly as Sail executes behind Livy for the Lakehouse.
+      FABRIC_SQL_TDS_ADDR: ":1433"
+      FABRIC_WAREHOUSE_SQL_URL: "server=sqlserver;user id=sa;password=${MSSQL_SA_PASSWORD:-Str0ng!Passw0rd};encrypt=disable;dial timeout=90;connection timeout=90"
     ports:
       - "${FABRIC_PORT:-19443}:9443"
     networks:
@@ -134,6 +141,11 @@ services:
       REQUESTS_CA_BUNDLE: "/tmp/ca-bundle.pem"
       FABRIC_API_ROOT: "https://api.fabric.microsoft.com:9443"
       FABRIC_ONELAKE_HOST: "onelake.dfs.fabric.microsoft.com"
+      # Where gold's TDS connection goes. The emulator terminates the protocol
+      # on 1433 under Fabric's own hostname, so the product addresses a
+      # Warehouse exactly as it would in production.
+      FABRIC_TDS_HOST: "api.fabric.microsoft.com"
+      FABRIC_TDS_PORT: "1433"
       ENTRA_TOKEN_URL: "http://entra-emulator:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/oauth2/v2.0/token"
       ENTRA_CLIENT_ID: "00d88624-f0d7-46f6-a641-6232c2608928"
       ENTRA_CLIENT_SECRET: "daemon-app-secret"
@@ -188,6 +200,34 @@ services:
         print("trust bundle: system CAs + emulator cert ->", out)
         CAEOF
         fi
+        # REGISTER THE AZURE SQL AUDIENCE. A Fabric Warehouse is Azure SQL
+        # underneath, so the bearer TDS accepts is minted for
+        # `https://database.windows.net` -- a DIFFERENT audience from the
+        # Fabric control plane's. Entra will not issue a token for an audience
+        # no application claims, so without this the product's request comes
+        # back HTTP 400 from the token endpoint, which names neither the
+        # audience nor the fact that it was never registered.
+        #
+        # A PLATFORM STEP, not a product one: in production the customer's
+        # tenant already has Azure SQL as a first-party application, and this
+        # is what standing that up locally looks like.
+        python3 - <<'AUDEOF'
+        import json, os, urllib.error, urllib.request
+        root = "/".join(os.environ["ENTRA_TOKEN_URL"].split("/")[:3])
+        body = json.dumps({"displayName": "Azure SQL",
+                           "appIdUri": "https://database.windows.net",
+                           "isConfidential": False}).encode()
+        req = urllib.request.Request(f"{root}/admin/api/apps", data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                print("platform: audience https://database.windows.net registered", r.status)
+        except urllib.error.HTTPError as e:
+            # 409 is the normal case against a warm emulator.
+            if e.code != 409:
+                raise
+            print("platform: audience https://database.windows.net already registered")
+        AUDEOF
         airflow db migrate
         airflow users create --username admin --password admin \
           --firstname Fabric --lastname Emulator --role Admin --email admin@example.com
@@ -231,6 +271,23 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # ---- The warehouse's engine ----------------------------------------------
+  # What executes gold's T-SQL. Microsoft's own SQL Server image: the emulator
+  # speaks the TDS wire protocol and this computes, so gold's dbt-fabric models
+  # run against a real T-SQL engine rather than a reimplementation of one.
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:${MSSQL_VERSION:?see versions.env}
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-Str0ng!Passw0rd}"
+      MSSQL_MEMORY_LIMIT_MB: "2048"
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
+             "-P", "${MSSQL_SA_PASSWORD:-Str0ng!Passw0rd}", "-C", "-Q", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
 
   # ---- The engine ----------------------------------------------------------
   # Sail is what a Fabric Spark pool IS here: the emulator terminates Livy and

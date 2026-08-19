@@ -62,7 +62,8 @@ def create(session: requests.Session, api: str, workspace: str, name: str) -> st
 
 
 def publish_dags(
-    session: requests.Session, api: str, workspace: str, item: str, dags: pathlib.Path
+    session: requests.Session, api: str, workspace: str, item: str, dags: pathlib.Path,
+    reparse: float = 15.0,
 ) -> list[str]:
     """PUT every .py under `dags/` into the item, and verify what landed.
 
@@ -103,6 +104,25 @@ def publish_dags(
         raise RuntimeError(
             f"the item did not store what was sent: {missing} against {landed}"
         )
+
+    # LET THE SCHEDULER RE-READ BEFORE ANYONE TRIGGERS.
+    #
+    # Publishing a CHANGED DAG and starting it immediately races Fabric's
+    # scheduler: the run is created from whatever structure is currently
+    # serialised, and the new file is parsed a moment later. The result is not
+    # an error -- it is a run whose task instances belong to the previous
+    # version. Twice now: once a task that the trigger rule referenced had no
+    # instance at all, and once a newly added task came back in state
+    # `removed` while its downstream failed. Both read as DAG bugs and neither
+    # is one.
+    #
+    # A WAIT, NOT A POLL, because there is nothing to poll. Fabric exposes the
+    # item and the job; whether its scheduler has re-serialised a DAG is not in
+    # that API, and reaching around it to Airflow's own endpoints would be
+    # asking a question production could not answer. The interval is the
+    # scheduler's own configured re-scan window plus margin, so it is bounded
+    # by a documented number rather than guessed.
+    time.sleep(reparse)
     return sorted(sent)
 
 

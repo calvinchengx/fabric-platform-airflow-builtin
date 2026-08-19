@@ -120,3 +120,19 @@ def test_an_unknown_job_status_is_not_treated_as_finished():
     assert "TERMINAL = {" in src
     for state in ("Completed", "Failed", "Cancelled"):
         assert f'"{state}"' in src
+
+
+def test_publishing_waits_for_the_scheduler_to_reread():
+    """A changed DAG published and triggered at once races re-serialisation.
+
+    The run is created from whatever structure is currently serialised, so a
+    newly added task comes back `removed` and its downstream fails -- a run
+    that looks like a DAG bug and is not one. It happened twice before this
+    wait existed.
+
+    Asserted structurally because the failure only appears when a DAG CHANGES,
+    which no unit test can stage and a steady-state integration run never hits.
+    """
+    src = (ROOT / "platform" / "airflowjob.py").read_text(encoding="utf-8")
+    assert "reparse" in src, "publish_dags must give the scheduler time to re-read"
+    assert "time.sleep(reparse)" in src
