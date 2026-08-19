@@ -55,6 +55,20 @@ services:
       FABRIC_AIRFLOW_PASSWORD: admin
     ports:
       - "${FABRIC_PORT:-19443}:9443"
+    networks:
+      default:
+        # THE NAMES FABRIC ACTUALLY HAS. DNS inside the compose network points
+        # them here, so the product addresses Fabric by its real hostnames and
+        # nothing in the DAG knows it is talking to an emulator -- and the
+        # emulator's certificate, which is issued for these names, matches.
+        #
+        # Addressing the container directly (`fabric-emulator:9443`) fails in a
+        # way that names none of this: delta-rs reports "Generic MicrosoftAzure
+        # error" against the abfss URI, because the cert does not cover the
+        # container name.
+        aliases:
+          - api.fabric.microsoft.com
+          - onelake.dfs.fabric.microsoft.com
     volumes:
       # SHARED WITH THE SIDECAR. The emulator writes DAG sources here and the
       # scheduler reads them from the same place, so the sync is a file copy
@@ -104,6 +118,22 @@ services:
       # thing that changes.
       CONTOSO_POS_API: "http://contoso-pos:8090"
       CONTOSO_POS_API_KEY: "${CONTOSO_POS_API_KEY:?the vendor's key -- make reads it from the sources fixture}"
+      # HOW THE PRODUCT REACHES FABRIC from inside Fabric's own scheduler.
+      # Supplied by the platform because they are deployment facts: in
+      # production these are a real tenant, a real service principal and real
+      # OneLake. The DAG reads them and branches on none of them.
+      FABRIC_API_ROOT: "https://api.fabric.microsoft.com:9443"
+      FABRIC_ONELAKE_HOST: "onelake.dfs.fabric.microsoft.com"
+      ENTRA_TOKEN_URL: "http://entra-emulator:8443/6f89cf12-978b-4d23-ac18-9ef0c127cf87/oauth2/v2.0/token"
+      ENTRA_CLIENT_ID: "00d88624-f0d7-46f6-a641-6232c2608928"
+      ENTRA_CLIENT_SECRET: "daemon-app-secret"
+      # WHAT DELTA-RS NEEDS TO REACH THIS ONELAKE, as data rather than as a
+      # branch in the product. The sibling leaf removed its last `if emulator:`
+      # exactly here: a deployment difference expressed as a branch is one the
+      # product must be edited to change.
+      FABRIC_STORAGE_OPTIONS: >-
+        {"azure_endpoint": "https://api.fabric.microsoft.com:9443/onelake",
+         "azure_allow_invalid_certificates": "true"}
     volumes:
       - airflow-dags:/opt/airflow/dags
     ports:
