@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+
+# A RUN ARTEFACT, not a source file. Committing it means a snapshot can outlive
+# the run that produced it and still be compared -- which is how this family
+# once published a green result for a defect that had already been fixed, and
+# would have again for one that had not. Re-run `make witness` to get one.
+product_snapshot.json

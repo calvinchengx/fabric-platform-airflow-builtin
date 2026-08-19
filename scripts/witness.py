@@ -34,14 +34,20 @@ TENANT = "6f89cf12-978b-4d23-ac18-9ef0c127cf87"
 CLIENT_ID = "00d88624-f0d7-46f6-a641-6232c2608928"
 CLIENT_SECRET = "daemon-app-secret"
 
+# THE FAMILY'S FILENAME, and the only thing this platform knows about what the
+# product publishes. `compare_products.py` in contoso-data-product reads one of
+# these per runtime; the product decides what goes in it, this decides where to
+# put the copy it fetched.
+SNAPSHOT = "product_snapshot.json"
 
-def token() -> str:
+
+def token(scope: str = "https://api.fabric.microsoft.com/.default") -> str:
     form = urllib.parse.urlencode(
         {
             "grant_type": "client_credentials",
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
-            "scope": "https://api.fabric.microsoft.com/.default",
+            "scope": scope,
         }
     ).encode()
     req = urllib.request.Request(
@@ -51,6 +57,36 @@ def token() -> str:
     )
     with urllib.request.urlopen(req, timeout=20) as response:
         return json.load(response)["access_token"]
+
+
+def fetch_snapshot(session: requests.Session, api: str) -> str | None:
+    """The product's snapshot, from whichever lakehouse it landed in.
+
+    BY CONVENTION, NOT BY CONFIGURATION. The DAG provisions its own workspace
+    and lakehouse and names them itself -- `provision` is the product's step,
+    and a platform that hardcoded those names would be a platform that only
+    runs one product. What both ends agree on is the FILENAME, which is the
+    family's, so this looks for that and nothing else.
+    """
+    storage = token("https://storage.azure.com/.default")
+    onelake = f"{FABRIC}/onelake"
+    listed = session.get(f"{api}/workspaces", timeout=60)
+    listed.raise_for_status()
+    for space in listed.json().get("value", []):
+        items = session.get(f"{api}/workspaces/{space['id']}/items", timeout=60)
+        items.raise_for_status()
+        for entry in items.json().get("value", []):
+            if entry.get("type") != "Lakehouse":
+                continue
+            got = session.get(
+                f"{onelake}/{space['id']}/{entry['id']}/Files/{SNAPSHOT}",
+                headers={"Authorization": f"Bearer {storage}"},
+                timeout=60,
+            )
+            if got.status_code == 200:
+                print(f"snapshot from {space['displayName']}/{entry['displayName']}")
+                return got.text
+    return None
 
 
 def main() -> int:
@@ -95,6 +131,23 @@ def main() -> int:
     print(f"running dag {dag_id!r} ...")
     state = airflowjob.run(session, api, workspace, item, dag_id, conf={"source": "witness"})
     print(f"PASS: Fabric's built-in Airflow ran {dag_id!r} -> {state.get('status')}")
+
+    # BRING THE EVIDENCE BACK. A green run is not the deliverable -- the
+    # numbers are, and until now they existed only in a task log that a person
+    # had to open and read out. `compare_products.py` cannot diff a log.
+    fetched = fetch_snapshot(session, api)
+    if fetched is None:
+        # NOT FATAL, and not silent either. The run genuinely passed; what is
+        # missing is the comparison, so saying so plainly beats both failing a
+        # good run and letting the cell look complete when it cannot be
+        # compared against its siblings.
+        print(
+            f"WARNING: the run passed but no {SNAPSHOT} was found in any "
+            f"lakehouse -- this cell cannot enter the family comparison."
+        )
+        return 0
+    pathlib.Path(SNAPSHOT).write_text(fetched, encoding="utf-8")
+    print(f"wrote {SNAPSHOT}: {json.loads(fetched)}")
     return 0
 
 
