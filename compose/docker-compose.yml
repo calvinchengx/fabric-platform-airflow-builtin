@@ -365,6 +365,17 @@ services:
       - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
     expose:
       - "8090"
+    # A SEATBELT, NOT A FIX. This vendor was OOM-killed at its own mem_limit
+    # after ~45 minutes and many runs -- with the host at 3.3 GiB of 15.7, so
+    # it was the container's ceiling, not host pressure. That points at growth
+    # across runs rather than one large export, which `--event-store-default-
+    # size=1` was supposed to bound.
+    #
+    # Restarting brings it back and the next request succeeds, which is
+    # precisely why this policy is dangerous on its own: it turns a real defect
+    # into an intermittent one that a green pipeline hides. Kept because a dead
+    # vendor should not end a run, and recorded so the growth is not forgotten.
+    restart: unless-stopped
 
   # THE SECOND VENDOR, and the reason there is one. A platform that ingests a
   # single source proves it can ingest a single source. Two is where the work
@@ -386,6 +397,17 @@ services:
       - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
     expose:
       - "8091"
+    # A SEATBELT, NOT A FIX. This vendor was OOM-killed at its own mem_limit
+    # after ~45 minutes and many runs -- with the host at 3.3 GiB of 15.7, so
+    # it was the container's ceiling, not host pressure. That points at growth
+    # across runs rather than one large export, which `--event-store-default-
+    # size=1` was supposed to bound.
+    #
+    # Restarting brings it back and the next request succeeds, which is
+    # precisely why this policy is dangerous on its own: it turns a real defect
+    # into an intermittent one that a green pipeline hides. Kept because a dead
+    # vendor should not end a run, and recorded so the growth is not forgotten.
+    restart: unless-stopped
 
   # THE THIRD VENDOR, and the first that is not an operational system. The
   # group data office publishes what the others are reported against. It is
@@ -406,6 +428,17 @@ services:
       - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
     expose:
       - "8092"
+    # A SEATBELT, NOT A FIX. This vendor was OOM-killed at its own mem_limit
+    # after ~45 minutes and many runs -- with the host at 3.3 GiB of 15.7, so
+    # it was the container's ceiling, not host pressure. That points at growth
+    # across runs rather than one large export, which `--event-store-default-
+    # size=1` was supposed to bound.
+    #
+    # Restarting brings it back and the next request succeeds, which is
+    # precisely why this policy is dangerous on its own: it turns a real defect
+    # into an intermittent one that a green pipeline hides. Kept because a dead
+    # vendor should not end a run, and recorded so the growth is not forgotten.
+    restart: unless-stopped
 
   # ---- The fourth vendor: a relational source, CAPTURED ---------------------
   # THREE SERVICES, because a change stream needs all three and any two of them
