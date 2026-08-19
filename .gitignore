@@ -9,3 +9,7 @@ __pycache__/
 # once published a green result for a defect that had already been fixed, and
 # would have again for one that had not. Re-run `make witness` to get one.
 product_snapshot.json
+
+# Generated from contoso-sources/sources.yaml by `make sources`. Derived, so
+# tracking it would recreate exactly the drift that generating it removed.
+compose/.sources.generated.yml

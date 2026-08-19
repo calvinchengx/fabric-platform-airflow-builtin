@@ -14,23 +14,44 @@ export PRODUCT_NAME := $(notdir $(PRODUCT_ABS))
 # The vendors are contoso-sources', mounted rather than copied.
 SOURCES ?= ../contoso-sources
 export SOURCES_ABS := $(abspath $(SOURCES))
-# THE VENDOR PUBLISHES ITS OWN KEY. Read from the fixture the vendor serves
-# rather than written here: this platform stores no credential, and the value
-# is the vendor's to change.
-export CONTOSO_POS_API_KEY := $(shell cat $(SOURCES_ABS)/_data/contoso-pos/.api-key 2>/dev/null)
-export CONTOSO_WEB_API_KEY := $(shell cat $(SOURCES_ABS)/_data/contoso-web/.api-key 2>/dev/null)
-export CONTOSO_REFERENCE_API_KEY := $(shell cat $(SOURCES_ABS)/_data/contoso-reference/.api-key 2>/dev/null)
-COMPOSE := PRODUCT=$(PRODUCT_ABS) PRODUCT_NAME=$(PRODUCT_NAME) SOURCES=$(SOURCES_ABS) \
-           CONTOSO_POS_API_KEY=$(CONTOSO_POS_API_KEY) \
-           CONTOSO_WEB_API_KEY=$(CONTOSO_WEB_API_KEY) \
-           CONTOSO_REFERENCE_API_KEY=$(CONTOSO_REFERENCE_API_KEY) PWD=$(CURDIR) \
-           docker compose -f compose/docker-compose.yml --env-file versions.env -p $(PROJECT)
+# The pins, as Make variables. `--env-file` below hands them to COMPOSE, but
+# `make sources` passes PYTHON_VERSION to a script -- and Make cannot expand a
+# variable from a file it never included. Measured: without this the generator
+# refused with "PYTHON_VERSION is unset" while versions.env plainly set it.
+include versions.env
+export
 
-.PHONY: help up down witness test lint logs
+# GENERATED, NOT WRITTEN. The vendors this platform starts, their memory
+# budgets, their credentials and the addresses the DAG reads all come from
+# `contoso-sources/sources.yaml` -- see scripts/sources.py for what a
+# hand-written copy of that cost. Gitignored, because it is derived.
+FRAGMENT := compose/.sources.generated.yml
+COMPOSE := PRODUCT=$(PRODUCT_ABS) PRODUCT_NAME=$(PRODUCT_NAME) SOURCES=$(SOURCES_ABS) PWD=$(CURDIR) \
+           docker compose -f compose/docker-compose.yml -f $(FRAGMENT) \
+           --env-file versions.env -p $(PROJECT)
+
+.PHONY: help up down witness test lint logs sources
 help: ## This list
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | expand -t12
 
-up: ## Start Fabric's control plane and the Airflow it hosts
+sources: ## Generate the vendor stack from whatever sources.yaml declares
+	@test -f "$(SOURCES_ABS)/sources.yaml" || { \
+	  echo "no sources.yaml at $(SOURCES_ABS) -- the product's vendors cannot be started"; exit 1; }
+	@PYTHON_VERSION=$(PYTHON_VERSION) python3 scripts/sources.py \
+	  "$(SOURCES_ABS)/sources.yaml" "$(SOURCES_ABS)" > $(FRAGMENT)
+	@echo "platform: $$(python3 -c "import json;print(len(json.load(open('$(FRAGMENT)'))['services'])-1)") vendor service(s) declared"
+
+up: sources ## Start Fabric's control plane and the Airflow it hosts
+	# THE DEFAULT PRODUCT CANNOT BUILD, and should say so in one line rather
+	# than 40 of buildkit output. `tests/fixture-product` exists for the
+	# repo-boundary tests, which never start Docker; it carries a DAG and no
+	# pyproject.toml, so the sidecar build fails on a missing file with no hint
+	# that the real cause is an unset variable. Measured, on the first teardown
+	# and rebuild this platform has had.
+	@test -f "$(PRODUCT_ABS)/pyproject.toml" || { \
+	  echo "platform: $(PRODUCT_ABS) has no pyproject.toml -- the sidecar is built"; \
+	  echo "          from the product's dependencies, so set PRODUCT to a real one:"; \
+	  echo "          make up PRODUCT=/path/to/a/product"; exit 1; }
 	# --build, ALWAYS. The sidecar carries the product's dependencies, so a
 	# product that adds one and a platform that reuses a cached image disagree
 	# silently: the DAG imports something the image does not have and fails at
@@ -40,7 +61,13 @@ up: ## Start Fabric's control plane and the Airflow it hosts
 	@echo "platform: Airflow UI on http://localhost:$${AIRFLOW_UI_PORT:-18085}"
 
 down: ## Stop and remove everything, volumes included
-	$(COMPOSE) down -v
+	# NO `-f` HERE, deliberately. Compose can remove everything labelled with the
+	# project without being told what the project contains -- and requiring the
+	# generated fragment would mean a stack could not be torn down when the
+	# sources repo is absent or the fragment was never written. Measured: `make
+	# down` failed with "no such file or directory" on a clean checkout, which
+	# is the one moment you most want it to work.
+	docker compose -p $(PROJECT) down -v
 
 witness: ## Publish a product's DAGs as an ApacheAirflowJob and run one
 	uv run --frozen python scripts/witness.py $(PRODUCT)

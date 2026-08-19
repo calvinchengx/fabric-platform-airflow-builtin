@@ -113,6 +113,19 @@ services:
         condition: service_healthy
       airflow-broker:
         condition: service_healthy
+      # AND THE EMULATOR, because this container's startup reads the
+      # emulator's TLS certificate out of the shared volume. Without this edge
+      # there is no ordering at all: on a stack started from EMPTY volumes the
+      # certificate does not exist yet, the trust bundle is silently not built,
+      # and every Fabric call then fails with "Could not find a suitable TLS CA
+      # certificate bundle" -- from `provision`, four steps from the cause.
+      #
+      # It survived this long because it only bites on a cold start. Every run
+      # until the first `make down -v` found a certificate left by an earlier
+      # one, which is precisely the class of bug a stack that is never torn
+      # down cannot see.
+      fabric-emulator:
+        condition: service_healthy
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       # Fabric's default, and the emulator's client unpauses before every
@@ -131,23 +144,15 @@ services:
       # address and credential; the DAG names neither. In production these are
       # the real vendor's hostname and a secret from a vault, which is the only
       # thing that changes.
-      CONTOSO_POS_API: "http://contoso-pos:8090"
-      CONTOSO_POS_API_KEY: "${CONTOSO_POS_API_KEY:?the vendor's key -- make reads it from the sources fixture}"
       # EACH VENDOR'S OWN KEY, from each vendor's own fixture. A key that
       # worked across vendors would prove nothing about any of them -- these
       # are separate companies with separately rotating credentials, which is
       # what having three vendors means rather than three routes on one.
-      CONTOSO_WEB_API: "http://contoso-web:8091"
-      CONTOSO_WEB_API_KEY: "${CONTOSO_WEB_API_KEY:?the vendor's key}"
-      CONTOSO_REFERENCE_API: "http://contoso-reference:8092"
-      CONTOSO_REFERENCE_API_KEY: "${CONTOSO_REFERENCE_API_KEY:?the vendor's key}"
       # The CDC vendor reaches the product as a BROKER and a DSN, not a base
       # URL -- which is what having a change stream instead of an API means.
       # The DSN carries the vendor's own dev credential, declared in
       # contoso-sources; the product holds no default for it.
-      CONTOSO_ERP_BROKER: "contoso-erp-broker:9092"
       CONTOSO_ERP_TOPIC: "contoso.erp.customer"
-      CONTOSO_ERP_DSN: "host=contoso-erp-db port=5432 dbname=erp user=contoso password=contoso-erp-dev"
       # HOW THE PRODUCT REACHES FABRIC from inside Fabric's own scheduler.
       # Supplied by the platform because they are deployment facts: in
       # production these are a real tenant, a real service principal and real
@@ -200,6 +205,22 @@ services:
         #
         # APPENDED, because replacing the store breaks everything else: dbt
         # reaching hub.getdbt.com then fails with CERTIFICATE_VERIFY_FAILED.
+        # WAIT FOR IT, and FAIL if it never arrives. This was a bare
+        # `if [ -f ... ]`, which on a cold start is false and skips silently --
+        # turning a missing certificate into a TLS error four steps later
+        # instead of a named failure here. The depends_on above should make the
+        # wait return immediately; this is what says so out loud if it does not.
+        for i in $(seq 1 60); do
+          [ -f /emu-data/tls/cert.pem ] && break
+          sleep 1
+        done
+        if [ ! -f /emu-data/tls/cert.pem ]; then
+          echo "platform: /emu-data/tls/cert.pem never appeared -- the emulator" >&2
+          echo "          did not publish its certificate, so nothing here can" >&2
+          echo "          verify TLS against it. Refusing to start a sidecar" >&2
+          echo "          whose every Fabric call would fail obscurely." >&2
+          exit 1
+        fi
         if [ -f /emu-data/tls/cert.pem ]; then
           python3 - <<'CAEOF'
         import pathlib, ssl
@@ -338,220 +359,16 @@ services:
       AZURE_STORAGE_ENDPOINT: "https://api.fabric.microsoft.com:9443/onelake"
       AZURE_ALLOW_INVALID_CERTIFICATES: "true"
 
-  # ---- The vendor -----------------------------------------------------------
-  # Contoso POS, from `contoso-sources` -- the same declaration and the same
-  # fixture bytes every other cell pulls from, which is the only reason gold
-  # numbers can be compared across the family at all. This platform mounts what
-  # that repository materialises; it does not carry a copy.
+  # THE VENDORS ARE NOT HERE, and that is the point. They are generated
+  # into `compose/.sources.generated.yml` from `contoso-sources/sources.yaml`
+  # by `make sources`, which `make up` depends on.
   #
-  # ONE VENDOR, because this cell is proving an ORCHESTRATOR, not an ingest.
-  # The Airflow 3 cell already witnesses all four. When this DAG widens to the
-  # medallion the other three come with it, generated from sources.yaml rather
-  # than hand-written here.
-  contoso-pos:
-    image: mokapi/mokapi:${MOKAPI_VERSION:?see versions.env}
-    command:
-      # The dashboard keeps every request AND its response body in memory; for
-      # a 95 MB export that is a multi-hundred-MB copy per call.
-      - --event-store-default-size=1
-      - /sources/contoso-pos/openapi.yaml
-      - /sources/contoso-pos/serve.js
-    environment:
-      # Go does not read the cgroup limit, so without this the heap climbs past
-      # mem_limit and the container is killed mid-response.
-      GOMEMLIMIT: 2GiB
-    mem_limit: 4g
-    volumes:
-      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
-    expose:
-      - "8090"
-    # A SEATBELT, NOT A FIX. This vendor was OOM-killed at its own mem_limit
-    # after ~45 minutes and many runs -- with the host at 3.3 GiB of 15.7, so
-    # it was the container's ceiling, not host pressure. That points at growth
-    # across runs rather than one large export, which `--event-store-default-
-    # size=1` was supposed to bound.
-    #
-    # Restarting brings it back and the next request succeeds, which is
-    # precisely why this policy is dangerous on its own: it turns a real defect
-    # into an intermittent one that a green pipeline hides. Kept because a dead
-    # vendor should not end a run, and recorded so the growth is not forgotten.
-    restart: unless-stopped
-
-  # THE SECOND VENDOR, and the reason there is one. A platform that ingests a
-  # single source proves it can ingest a single source. Two is where the work
-  # starts: its own credential, JSON arrays where POS ships delimited text, and
-  # orders that arrive NESTED because a storefront thinks in baskets.
-  contoso-web:
-    image: mokapi/mokapi:${MOKAPI_VERSION:?see versions.env}
-    command:
-      - --event-store-default-size=1
-      - /sources/contoso-web/openapi.yaml
-      - /sources/contoso-web/serve.js
-    environment:
-      # The budget contoso-sources declares for THIS vendor -- smaller than
-      # POS's, because its whole export is 36 MB against POS's 170 MB. A
-      # memory budget is a fact about the vendor, not about whoever runs it.
-      GOMEMLIMIT: 1GiB
-    mem_limit: 2g
-    volumes:
-      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
-    expose:
-      - "8091"
-    # A SEATBELT, NOT A FIX. This vendor was OOM-killed at its own mem_limit
-    # after ~45 minutes and many runs -- with the host at 3.3 GiB of 15.7, so
-    # it was the container's ceiling, not host pressure. That points at growth
-    # across runs rather than one large export, which `--event-store-default-
-    # size=1` was supposed to bound.
-    #
-    # Restarting brings it back and the next request succeeds, which is
-    # precisely why this policy is dangerous on its own: it turns a real defect
-    # into an intermittent one that a green pipeline hides. Kept because a dead
-    # vendor should not end a run, and recorded so the growth is not forgotten.
-    restart: unless-stopped
-
-  # THE THIRD VENDOR, and the first that is not an operational system. The
-  # group data office publishes what the others are reported against. It is
-  # also the only one serving BINARY, so it is the only one whose transport can
-  # corrupt a payload while leaving it structurally valid -- which is why the
-  # product verifies the digest this vendor publishes.
-  contoso-reference:
-    image: mokapi/mokapi:${MOKAPI_VERSION:?see versions.env}
-    command:
-      - --event-store-default-size=1
-      - /sources/contoso-reference/openapi.yaml
-      - /sources/contoso-reference/serve.js
-    environment:
-      # Far lower: this vendor's entire export is about four kilobytes.
-      GOMEMLIMIT: 256MiB
-    mem_limit: 512m
-    volumes:
-      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
-    expose:
-      - "8092"
-    # A SEATBELT, NOT A FIX. This vendor was OOM-killed at its own mem_limit
-    # after ~45 minutes and many runs -- with the host at 3.3 GiB of 15.7, so
-    # it was the container's ceiling, not host pressure. That points at growth
-    # across runs rather than one large export, which `--event-store-default-
-    # size=1` was supposed to bound.
-    #
-    # Restarting brings it back and the next request succeeds, which is
-    # precisely why this policy is dangerous on its own: it turns a real defect
-    # into an intermittent one that a green pipeline hides. Kept because a dead
-    # vendor should not end a run, and recorded so the growth is not forgotten.
-    restart: unless-stopped
-
-  # ---- The fourth vendor: a relational source, CAPTURED ---------------------
-  # THREE SERVICES, because a change stream needs all three and any two of them
-  # is a snapshot wearing a stream's name. The database holds the rows,
-  # Debezium reads its write-ahead log, and the broker carries what Debezium
-  # produced. Standing up only Postgres would serve rows -- possibly even the
-  # right count -- while testing something else entirely.
-  #
-  # This vendor exists so CDC and SCD2 are real rather than aspirational. A
-  # snapshot cannot say that a customer was in Germany BEFORE they were in
-  # France, and the fixture disagrees between capture order and business order
-  # on purpose, so a pipeline that sorts by the wrong one still gets the wrong
-  # answer. That is the lesson this vendor is here to teach.
-  contoso-erp-db:
-    image: postgres:${POSTGRES_VERSION:?see versions.env}
-    # wal_level=logical is not tuning. Without it Postgres emits no logical
-    # replication stream at all and Debezium fails at connector creation with
-    # a message about replication slots that does not name this setting.
-    command:
-      - postgres
-      - -c
-      - wal_level=logical
-      - -c
-      - max_replication_slots=4
-      - -c
-      - max_wal_senders=4
-    environment:
-      POSTGRES_USER: contoso
-      POSTGRES_PASSWORD: contoso-erp-dev
-      POSTGRES_DB: erp
-    volumes:
-      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U contoso -d erp"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-
-  contoso-erp-broker:
-    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:?see versions.env}
-    # ONE LISTENER is enough here, unlike the platforms whose ingest runs on the
-    # host: this DAG consumes from inside the compose network, so there is no
-    # second address to advertise.
-    command:
-      - redpanda
-      - start
-      - --mode=dev-container
-      - --smp=1
-      - --kafka-addr=INTERNAL://0.0.0.0:9092
-      - --advertise-kafka-addr=INTERNAL://contoso-erp-broker:9092
-    healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
-      interval: 5s
-      timeout: 5s
-      retries: 30
-
-  contoso-erp-connect:
-    image: debezium/connect:${DEBEZIUM_VERSION:?see versions.env}
-    depends_on:
-      contoso-erp-db: {condition: service_healthy}
-      contoso-erp-broker: {condition: service_healthy}
-    environment:
-      BOOTSTRAP_SERVERS: "contoso-erp-broker:9092"
-      GROUP_ID: contoso_erp
-      CONFIG_STORAGE_TOPIC: _connect_configs
-      OFFSET_STORAGE_TOPIC: _connect_offsets
-      STATUS_STORAGE_TOPIC: _connect_status
-      # One partition each: ordering per key is what CDC guarantees, and more
-      # would trade that away for throughput this does not need.
-      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
-      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
-      STATUS_STORAGE_REPLICATION_FACTOR: "1"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-
-  # THE SEEDER MAKES THE VENDOR EXIST. It registers the Debezium connector and
-  # THEN replays the fixture's history as real INSERT/UPDATE/DELETE, so the
-  # stream is CAPTURED rather than described. Landing a file that describes a
-  # change feed would be a different and much weaker claim.
-  #
-  # A step, not a service: `restart: no` and a one-shot command, because it
-  # must not loop if the replay fails.
-  contoso-erp-seed:
-    image: python:${PYTHON_VERSION:?see versions.env}-slim
-    depends_on:
-      contoso-erp-db: {condition: service_healthy}
-      contoso-erp-connect: {condition: service_healthy}
-    environment:
-      ERP_DSN: "host=contoso-erp-db port=5432 dbname=erp user=contoso password=contoso-erp-dev"
-      ERP_CONNECT_URL: "http://contoso-erp-connect:8083"
-      ERP_DB_HOST: contoso-erp-db
-      PYTHONUNBUFFERED: "1"
-    volumes:
-      - ${SOURCES:?set SOURCES=/path/to/contoso-sources}:/sources:rw
-    working_dir: /sources
-    # --frozen --no-sync is load-bearing. A bare `uv run` RE-SYNCS and prunes
-    # anything absent from the lock, evicting the generators and psycopg
-    # installed moments earlier and then failing with ModuleNotFoundError for a
-    # package that was just there. psycopg goes in AFTER fixtures.py, because
-    # that script calls `uv sync` itself.
-    command:
-      - sh
-      - -c
-      - |
-        pip install --quiet uv &&
-        uv sync --quiet &&
-        uv run --frozen --no-sync python scripts/fixtures.py &&
-        uv pip install --quiet 'psycopg[binary]' &&
-        uv run --frozen --no-sync python scripts/seed_erp.py
-    restart: "no"
+  # This file used to declare all four by hand, and the copy had drifted in
+  # three ways while the declaration was right: every vendor carried the POS
+  # system's 2GiB/4g budget (so a vendor serving 4 KB held a 4 GB ceiling),
+  # a restart policy existed only here and so was invisible to the three
+  # sibling platforms running the same vendor, and the ERP's credentials
+  # were restated in three places. See scripts/sources.py.
 
 volumes:
   airflow-dags:
