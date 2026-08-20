@@ -60,10 +60,37 @@ jobs:
       # Only on dispatch. The schedule verifies the existing pin, which answers
       # the other question worth asking: does the version we claim to support
       # still work today?
-      - if: github.event_name == 'repository_dispatch'
-        name: Point at the released version
+      # WHICH VERSION THIS RUN IS ABOUT.
+      #
+      # On a dispatch it is the release that fired. On the schedule it is the
+      # NEWEST release, resolved here rather than assumed to be the pin.
+      #
+      # THAT IS WHAT MAKES THE DISPATCH OPTIONAL. A cross-repository dispatch
+      # needs a token with write on every platform, and when that token expires
+      # or is under-scoped the platforms go quiet with nothing to say so. Polling
+      # costs a day of latency and no secret at all, so the dispatch is now an
+      # optimisation for immediacy rather than the only way this runs.
+      #
+      # When the platform is already current, `latest` equals the pin and this
+      # behaves exactly as the schedule did before: it answers "does the version
+      # we claim to support still work today?".
+      - name: Resolve the version to verify
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python3 scripts/set_release.py "${{ github.event.client_payload.version }}"
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            version="${{ github.event.client_payload.version }}"
+            echo "dispatched for $version"
+          else
+            version=$(gh release view --repo calvinchengx/fabric-emulator \
+                        --json tagName -q .tagName | sed 's/^v//')
+            echo "newest release is $version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Point at that version
+        run: |
+          python3 scripts/set_release.py "${{ steps.target.outputs.version }}"
           git --no-pager diff --stat versions.env
       - run: make up PRODUCT=../contoso-data-product-fabric-airflow-builtin SOURCES=../contoso-sources
       - run: make witness PRODUCT=../contoso-data-product-fabric-airflow-builtin SOURCES=../contoso-sources
@@ -73,10 +100,13 @@ jobs:
       #
       # No `if: always()`. A step with no condition runs only when everything
       # before it passed, which is the gate wanted: a red run leaves the pin.
-      - if: github.event_name == 'repository_dispatch'
-        name: Adopt the version this run just verified
+      # ADOPT WHENEVER THE PIN MOVED, not only on a dispatch. A scheduled run
+      # that verified a newer release end to end has proved exactly what a
+      # dispatched one proves, and throwing that away would mean the pin only
+      # ever advances when a cross-repository token happens to be working.
+      - name: Adopt the version this run just verified
         env:
-          VERSION: ${{ github.event.client_payload.version }}
+          VERSION: ${{ steps.target.outputs.version }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
