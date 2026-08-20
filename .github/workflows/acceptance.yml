@@ -1,0 +1,92 @@
+# Does a PUBLISHED fabric-emulator still carry this platform end to end?
+#
+# CI proves what this repository owns; this proves what it CONSUMES. Until now
+# the emulator's release told only `fabric-platform-notebook-pipelines`, so this
+# platform's pin moved when somebody remembered, and a release that broke the
+# built-in ApacheAirflowJob path would have been found by a person rather than
+# by a run.
+name: Acceptance
+
+on:
+  # Fired by fabric-emulator's release workflow.
+  repository_dispatch:
+    types: [fabric-emulator-release]
+  # THE GUARD. A dispatch that silently fails to fire (revoked token, renamed
+  # event type, a workflow auto-disabled after 60 days of inactivity) is
+  # indistinguishable from one that fired and passed. The schedule makes that
+  # absence loud within a day.
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Verify the released emulator end to end
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: fabric-platform-airflow-builtin
+    # To push the adopted pin back; the repository default is read-only.
+    permissions:
+      contents: write
+    steps:
+      # Full history and a usable token: a depth-1 detached HEAD cannot rebase
+      # onto a main that moved during the run.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          path: fabric-platform-airflow-builtin
+      # THE VENDORS, declared in contoso-sources and materialised from it.
+      - uses: actions/checkout@v7
+        with:
+          repository: calvinchengx/contoso-sources
+          path: contoso-sources
+      # THE PRODUCT. This platform carries none: `PRODUCT` is a path, and the
+      # default (`tests/fixture-product`) deliberately cannot build, so a run
+      # that forgot this would fail naming the missing pyproject.toml.
+      - uses: actions/checkout@v7
+        with:
+          repository: calvinchengx/contoso-data-product-fabric-airflow-builtin
+          path: contoso-data-product-fabric-airflow-builtin
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.32"
+      # VERIFY THE RELEASE THAT FIRED, not the pin in the checkout. A dispatch
+      # for 0.33.0 that ran against the 0.32.0 in versions.env would report
+      # success, in the emulator's own release history, for a release nobody
+      # tested.
+      #
+      # Only on dispatch. The schedule verifies the existing pin, which answers
+      # the other question worth asking: does the version we claim to support
+      # still work today?
+      - if: github.event_name == 'repository_dispatch'
+        name: Point at the released version
+        run: |
+          python3 scripts/set_release.py "${{ github.event.client_payload.version }}"
+          git --no-pager diff --stat versions.env
+      - run: make up PRODUCT=../contoso-data-product-fabric-airflow-builtin SOURCES=../contoso-sources
+      - run: make witness PRODUCT=../contoso-data-product-fabric-airflow-builtin SOURCES=../contoso-sources
+      # ADOPT WHAT THIS RUN JUST PROVED. The pin has been verified end to end by
+      # here and is sitting uncommitted; discarding it and asking a human to
+      # retype it is the only thing between a verified release and an adopted one.
+      #
+      # No `if: always()`. A step with no condition runs only when everything
+      # before it passed, which is the gate wanted: a red run leaves the pin.
+      - if: github.event_name == 'repository_dispatch'
+        name: Adopt the version this run just verified
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet versions.env; then
+            echo "already pinned at $VERSION; nothing to adopt"
+            exit 0
+          fi
+          git commit -qm "pin $VERSION, adopted by the acceptance run that verified it" versions.env
+          git pull --rebase --quiet origin main
+          git push origin HEAD:main
+          echo "adopted $VERSION" >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        run: make down
