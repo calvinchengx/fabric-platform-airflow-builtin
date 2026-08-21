@@ -92,6 +92,17 @@ jobs:
         run: |
           python3 scripts/set_release.py "${{ steps.target.outputs.version }}"
           git --no-pager diff --stat versions.env
+      # THE BYTES, not just the declaration checked out above. The platform's
+      # own `make sources` generates the compose fragment and refuses when the
+      # vendors' fixtures are absent -- on the first scheduled run it refused
+      # on `_data/contoso-pos/.api-key`, because nothing here had ever
+      # materialised the sources repo. The refusal is right: mokapi would
+      # otherwise answer every request 200 from the schema, and a medallion
+      # built on invented rows is worse than a red. The two sibling platforms
+      # that made this split first carry the same step.
+      - name: Materialise the vendor exports
+        run: make sources
+        working-directory: contoso-sources
       - run: make up PRODUCT=../contoso-data-product-fabric-airflow-builtin SOURCES=../contoso-sources
       - run: make witness PRODUCT=../contoso-data-product-fabric-airflow-builtin SOURCES=../contoso-sources
       # ADOPT WHAT THIS RUN JUST PROVED. The pin has been verified end to end by
