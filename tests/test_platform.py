@@ -314,3 +314,41 @@ def test_the_sidecar_waits_for_the_emulators_certificate():
     # sidecar whose every Fabric call would fail obscurely.
     assert "never appeared" in COMPOSE
     assert "exit 1" in COMPOSE
+
+
+def test_the_acceptance_run_asserts_the_numbers_and_not_only_the_run():
+    """A nightly that proves the DAG RAN proves nothing about the answer.
+
+    G50: across all seven platforms with an acceptance workflow, none compared a
+    snapshot against an expected value. This cell has fetched
+    product_snapshot.json out of OneLake since DoD 4 and nothing read it back,
+    so gold could have returned different money indefinitely behind a green tick.
+
+    THE FILENAME IS THE CONTRACT between witness.py and this step, and it is the
+    same one the DAG writes. Asserting them together means a rename in the
+    script cannot leave the workflow reading a file nobody produces.
+
+    The core checkout must be PINNED. Left tracking main, this cell's
+    expectations could move without a reviewed commit here -- a nightly that
+    another repository can turn green.
+    """
+    raw = (ROOT / ".github" / "workflows" / "acceptance.yml").read_text(encoding="utf-8")
+    wf = "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("#"))
+    assert "scripts/assert_snapshot.py" in wf, (
+        "the acceptance run never asserts the figures core publishes"
+    )
+    core = wf[wf.index("repository: calvinchengx/contoso-data-product\n") :]
+    assert re.search(r"ref: [0-9a-f]{40}", core[: core.index("path:")]), (
+        "the contoso-data-product checkout is not pinned to a commit"
+    )
+    assert wf.index("make witness") < wf.index("scripts/assert_snapshot.py"), (
+        "the numbers are asserted before the run that produces them"
+    )
+
+    witness = (ROOT / "scripts" / "witness.py").read_text(encoding="utf-8")
+    name = re.search(r'^SNAPSHOT = "([^"]+)"', witness, re.M)
+    assert name, "witness.py no longer names the file it fetches"
+    assert f"{name.group(1)}\n" in wf, (
+        f"witness.py writes {name.group(1)} and the acceptance run reads "
+        f"something else"
+    )
