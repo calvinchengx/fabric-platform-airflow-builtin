@@ -30,7 +30,7 @@ COMPOSE := PRODUCT=$(PRODUCT_ABS) PRODUCT_NAME=$(PRODUCT_NAME) SOURCES=$(SOURCES
            docker compose -f compose/docker-compose.yml -f $(FRAGMENT) \
            --env-file versions.env -p $(PROJECT)
 
-.PHONY: help up down witness test lint logs sources
+.PHONY: help up down witness test lint logs sources doctor
 help: ## This list
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | expand -t12
 
@@ -41,17 +41,23 @@ sources: ## Generate the vendor stack from whatever sources.yaml declares
 	  "$(SOURCES_ABS)/sources.yaml" "$(SOURCES_ABS)" > $(FRAGMENT)
 	@echo "platform: $$(python3 -c "import json;print(len(json.load(open('$(FRAGMENT)'))['services'])-1)") vendor service(s) declared"
 
-up: sources ## Start Fabric's control plane and the Airflow it hosts
+doctor: ## Refuse to start against a product that cannot work
+	@command -v docker >/dev/null || { echo "docker is required"; exit 1; }
+	@test -d "$(PRODUCT_ABS)" || { echo "no product at $(PRODUCT_ABS)"; exit 1; }
+	@test -f "$(PRODUCT_ABS)/pyproject.toml" || { \
+	  echo "platform: $(PRODUCT_ABS) has no pyproject.toml -- the sidecar is built"; \
+	  echo "          from the product's dependencies, so set PRODUCT to a real one:"; \
+	  echo "          make up PRODUCT=/path/to/a/product"; exit 1; }
+	@test -d "$(PRODUCT_ABS)/dags" || { echo "$(PRODUCT_ABS) has no dags/ -- nothing to publish"; exit 1; }
+	@echo "doctor: docker present, product $(PRODUCT_NAME) has a pyproject.toml and dags/"
+
+up: sources doctor ## Start Fabric's control plane and the Airflow it hosts
 	# THE DEFAULT PRODUCT CANNOT BUILD, and should say so in one line rather
 	# than 40 of buildkit output. `tests/fixture-product` exists for the
 	# repo-boundary tests, which never start Docker; it carries a DAG and no
 	# pyproject.toml, so the sidecar build fails on a missing file with no hint
 	# that the real cause is an unset variable. Measured, on the first teardown
 	# and rebuild this platform has had.
-	@test -f "$(PRODUCT_ABS)/pyproject.toml" || { \
-	  echo "platform: $(PRODUCT_ABS) has no pyproject.toml -- the sidecar is built"; \
-	  echo "          from the product's dependencies, so set PRODUCT to a real one:"; \
-	  echo "          make up PRODUCT=/path/to/a/product"; exit 1; }
 	# --build, ALWAYS. The sidecar carries the product's dependencies, so a
 	# product that adds one and a platform that reuses a cached image disagree
 	# silently: the DAG imports something the image does not have and fails at
