@@ -22,7 +22,7 @@
 # the defect fabric-emulator#320 fixes on the emulator's own side.
 services:
   entra-emulator:
-    image: ghcr.io/calvinchengx/entra-emulator:${ENTRA_EMULATOR_VERSION:?see versions.env}
+    image: ghcr.io/calvinchengx/entra-emulator:${ENTRA_EMULATOR_VERSION:?see versions.env}@${ENTRA_EMULATOR_DIGEST:?see versions.env}
     environment:
       ORIGIN_MODE: compat
       TLS_ENABLED: "false"
@@ -37,7 +37,7 @@ services:
       retries: 30
 
   fabric-emulator:
-    image: ghcr.io/calvinchengx/fabric-emulator:${FABRIC_EMULATOR_VERSION:?see versions.env}
+    image: ghcr.io/calvinchengx/fabric-emulator:${FABRIC_EMULATOR_VERSION:?see versions.env}@${FABRIC_EMULATOR_DIGEST:?see versions.env}
     depends_on:
       entra-emulator:
         condition: service_healthy
@@ -107,6 +107,8 @@ services:
       args:
         AIRFLOW_VERSION: ${AIRFLOW_VERSION:?see versions.env}
         PRODUCT_DIR: ${PRODUCT_NAME:?set by the Makefile}
+    # digest-exempt: built locally by this compose file — there is no
+    # registry manifest to pin, and the `build:` below is its identity.
     image: contoso-fabric-builtin-airflow:${AIRFLOW_VERSION:?see versions.env}
     depends_on:
       airflow-db:
@@ -287,7 +289,7 @@ services:
   # A parallel executor needs concurrent writers; SQLite answers
   # `database is locked`, so the database is not a separable choice.
   airflow-db:
-    image: postgres:${POSTGRES_VERSION:?see versions.env}
+    image: postgres:${POSTGRES_VERSION:?see versions.env}@${POSTGRES_DIGEST:?see versions.env}
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
@@ -301,7 +303,7 @@ services:
   # The queue between scheduler and worker: the part that makes the executor
   # Celery rather than Local.
   airflow-broker:
-    image: redis:${REDIS_VERSION:?see versions.env}
+    image: redis:${REDIS_VERSION:?see versions.env}@${REDIS_DIGEST:?see versions.env}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -313,7 +315,7 @@ services:
   # speaks the TDS wire protocol and this computes, so gold's dbt-fabric models
   # run against a real T-SQL engine rather than a reimplementation of one.
   sqlserver:
-    image: mcr.microsoft.com/mssql/server:${MSSQL_VERSION:?see versions.env}
+    image: mcr.microsoft.com/mssql/server:${MSSQL_VERSION:?see versions.env}@${MSSQL_DIGEST:?see versions.env}
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-Str0ng!Passw0rd}"
