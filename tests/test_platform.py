@@ -31,9 +31,24 @@ def test_compose_reads_every_pin():
     # platform owns -- just one whose consumer is a script.
     generated = {"PYTHON_VERSION"}
     sources = (ROOT / "scripts" / "sources.py").read_text(encoding="utf-8")
+    # A _RELEASE is NOT an image reference and compose must not read one. It
+    # records which fabric-emulator release built an image whose tag names a
+    # dependency instead -- `emulator-sail:0.7.0` says which Sail is inside and
+    # nothing about the launcher beside it, which moves every release under that
+    # same tag. Its consumer is the pin check, which reads the label off the
+    # pinned digest and fails if this file disagrees. So the invariant this test
+    # protects is unchanged -- nothing is pinned that nothing reads -- and the
+    # reader is CI rather than the stack.
+    checked_in_ci = {k for k in pins() if k.endswith("_RELEASE")}
+    pin_check = (ROOT / ".github" / "workflows" / "pins.yml").read_text(encoding="utf-8")
     for key in pins():
         if key in generated:
             assert key in sources, f"{key} is pinned but nothing reads it"
+            continue
+        if key in checked_in_ci:
+            assert key in pin_check or key[: -len("_RELEASE")] in pin_check, (
+                f"{key} is pinned but nothing reads it"
+            )
             continue
         assert "${" + key in COMPOSE, f"{key} is pinned but nothing reads it"
 
