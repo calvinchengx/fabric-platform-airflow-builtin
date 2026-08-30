@@ -15,6 +15,7 @@ The product supplies `dags/`. This file knows nothing else about it.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import urllib.parse
@@ -39,6 +40,70 @@ CLIENT_SECRET = "daemon-app-secret"
 # these per runtime; the product decides what goes in it, this decides where to
 # put the copy it fetched.
 SNAPSHOT = "product_snapshot.json"
+
+
+# Where Airflow itself answers. Fabric's job API reports a status and nothing
+# else, so this is the only place the REASON exists.
+AIRFLOW = f"http://localhost:{os.environ.get('AIRFLOW_UI_PORT', '18085')}/api/v1"
+AIRFLOW_AUTH = ("admin", "admin")
+
+
+def explain(dag_id: str, tail: int = 60) -> None:
+    """Print why the run failed: the failed tasks, and the log of the first.
+
+    WHY THIS EXISTS. Fabric's job instance answers
+    `{"errorCode": "AirflowRunFailed", "message": "The job failed."}` and that
+    is the whole of it: no task, no traceback, no clue. Four minutes of DAG
+    execution reduced to three words, and a CI log nobody can act on. The two
+    airflow3 platforms learned the same lesson and their `verify` prints the
+    failed task's log; this is the built-in-Airflow equivalent.
+
+    BEST EFFORT, AND NEVER FATAL. It runs while a failure is already being
+    raised, so anything it cannot reach is reported and swallowed: a diagnostic
+    that raises on top of the real error replaces the thing you were trying to
+    read.
+    """
+    try:
+        runs = requests.get(
+            f"{AIRFLOW}/dags/{dag_id}/dagRuns",
+            params={"order_by": "-start_date", "limit": 1},
+            auth=AIRFLOW_AUTH, timeout=20,
+        )
+        runs.raise_for_status()
+        entries = runs.json().get("dag_runs", [])
+        if not entries:
+            print(f"  (Airflow reports no run of {dag_id} to explain)", file=sys.stderr)
+            return
+        run_id = entries[0]["dag_run_id"]
+
+        tis = requests.get(
+            f"{AIRFLOW}/dags/{dag_id}/dagRuns/{run_id}/taskInstances",
+            auth=AIRFLOW_AUTH, timeout=20,
+        )
+        tis.raise_for_status()
+        instances = tis.json().get("task_instances", [])
+        print(f"\n  {dag_id} run {run_id}:", file=sys.stderr)
+        for ti in sorted(instances, key=lambda t: t.get("task_id", "")):
+            print(f"    {ti.get('state','?'):<10} {ti.get('task_id')}", file=sys.stderr)
+
+        failed = [t for t in instances if t.get("state") == "failed"]
+        if not failed:
+            print("  no task is marked failed; the run failed above the tasks",
+                  file=sys.stderr)
+            return
+        first = failed[0]
+        log = requests.get(
+            f"{AIRFLOW}/dags/{dag_id}/dagRuns/{run_id}/taskInstances/"
+            f"{first['task_id']}/logs/{first.get('try_number', 1)}",
+            params={"full_content": "true"}, auth=AIRFLOW_AUTH, timeout=30,
+        )
+        log.raise_for_status()
+        lines = log.text.splitlines()
+        print(f"\n  ---- {first['task_id']}, last {tail} lines ----", file=sys.stderr)
+        for line in lines[-tail:]:
+            print(f"  {line}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not replace the error
+        print(f"  (could not read the task log from Airflow: {exc})", file=sys.stderr)
 
 
 def token(scope: str = "https://api.fabric.microsoft.com/.default") -> str:
@@ -129,7 +194,12 @@ def main() -> int:
 
     dag_id = pathlib.Path(published[0]).stem
     print(f"running dag {dag_id!r} ...")
-    state = airflowjob.run(session, api, workspace, item, dag_id, conf={"source": "witness"})
+    try:
+        state = airflowjob.run(session, api, workspace, item, dag_id, conf={"source": "witness"})
+    except airflowjob.JobFailed:
+        # Fabric says only "The job failed". Say which task, and why.
+        explain(dag_id)
+        raise
     print(f"PASS: Fabric's built-in Airflow ran {dag_id!r} -> {state.get('status')}")
 
     # BRING THE EVIDENCE BACK. A green run is not the deliverable -- the
