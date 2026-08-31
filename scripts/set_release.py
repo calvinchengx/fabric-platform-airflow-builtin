@@ -39,6 +39,13 @@ VERSIONS = ROOT / "versions.env"
 # release that says nothing about them would be a change nobody asked for.
 TRACKS_THE_RELEASE = ("FABRIC_EMULATOR_VERSION",)
 
+# The sidecars' TAG names the dependency they carry (0.7.0, 4.2.0), so it cannot
+# say which release built them. `_RELEASE` says it, and this is what keeps it
+# true: after the 0.34.0 bump these labels read 0.33.0 above 0.34.0 digests,
+# because nothing here moved them. versions.env asserted something false, and
+# the BOM's gate compares exactly this field.
+CARRIES_A_DEPENDENCY_TAG = ("SAIL_ENGINE", "SPARK_CLIENT")
+
 # digest var prefix -> (image, the tag to resolve; "release" means this release)
 PINS = {
     "FABRIC_EMULATOR": ("ghcr.io/calvinchengx/fabric-emulator", "release"),
@@ -95,6 +102,9 @@ def set_version(text: str, version: str) -> tuple[str, dict[str, str]]:
         key, _, old = stripped.partition("=")
         key, old = key.strip(), old.strip()
         if key in TRACKS_THE_RELEASE:
+            moved[key] = old
+            lines[i] = f"{key}={version}\n"
+        elif key.endswith("_RELEASE") and key[: -len("_RELEASE")] in CARRIES_A_DEPENDENCY_TAG:
             moved[key] = old
             lines[i] = f"{key}={version}\n"
     return "".join(lines), moved
