@@ -71,7 +71,21 @@ up: sources doctor ## Start Fabric's control plane and the Airflow it hosts
 	# silently: the DAG imports something the image does not have and fails at
 	# run time with ModuleNotFoundError, three steps from the pyproject.toml
 	# that changed. Measured -- adding contoso-data-product did exactly this.
-	$(COMPOSE) up -d --wait --build
+# WHAT THE STACK SAID ON THE WAY DOWN. `compose up` resolves depends_on
+# itself and reports only `dependency failed to start` -- which container, and
+# nothing about WHY it exited. That is how G48, a released emulator that did
+# not boot in a sibling stack, survived a release and three CI runs without a
+# single line of diagnosis. The logs exist at this moment and are gone as soon
+# as anyone runs `make down`, which CI does in its cleanup step.
+#
+# `ps -a` first because it names which container died and with what code; the
+# logs then say what it said on the way out. Both are bounded (`--tail`) so a
+# noisy stack cannot bury the failure it is meant to explain.
+	@$(COMPOSE) up -d --wait --build || { \
+	  echo "platform: the stack did not come up. what the containers said:"; \
+	  $(COMPOSE) ps -a; \
+	  $(COMPOSE) logs --no-color --tail=80; \
+	  exit 1; }
 	@echo "platform: Airflow UI on http://localhost:$${AIRFLOW_UI_PORT:-18085}"
 
 down: ## Stop and remove everything, volumes included
