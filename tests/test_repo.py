@@ -83,9 +83,18 @@ def test_a_release_moves_every_digest_with_its_version(tmp_path):
     for prefix in set_release.PINS:
         assert re.search(rf"^{prefix}_DIGEST={fake}$", written, re.M), (
             f"{prefix} kept a stale digest beside a moved release")
-    # The dependency versions must NOT be dragged to the emulator's number.
-    assert re.search(r"^SAIL_ENGINE_VERSION=0\.7\.0$", written, re.M)
-    assert re.search(r"^SPARK_CLIENT_VERSION=4\.2\.0$", written, re.M)
+    # The dependency versions must NOT be dragged to the emulator's number --
+    # and must NOT be asserted as literals either. This used to read
+    # `SAIL_ENGINE_VERSION=0.7.0`, encoding "the Sail engine never moves" as a
+    # constant. fabric-emulator v0.36.0 moved pysail to 0.7.1, the 0.7.0 tag
+    # kept naming the previous build, and this assertion then FAILED the
+    # correct pin. What the release must preserve is whatever was there.
+    before = (ROOT / "versions.env").read_text(encoding="utf-8")
+    for dep in ("SAIL_ENGINE_VERSION", "SPARK_CLIENT_VERSION"):
+        was = re.search(rf"^{dep}=(.+)$", before, re.M).group(1)
+        now = re.search(rf"^{dep}=(.+)$", written, re.M).group(1)
+        assert now == was, f"{dep} moved {was} -> {now}; a release must not touch it"
+        assert now != "9.9.9", f"{dep} was dragged to the emulator's version"
 
 
 def test_every_digest_in_versions_env_is_moved_by_a_release():
