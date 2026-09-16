@@ -56,9 +56,8 @@ def test_a_release_moves_every_digest_with_its_version(tmp_path):
     acceptance run reported it as verifying the new one — a green run for a
     release nobody tested, which is exactly what this script exists to prevent.
 
-    Note SAIL_ENGINE and SPARK_CLIENT: their VERSIONS do not move (0.7.0 is the
-    Sail engine, 4.2.0 the Spark Connect client) but their DIGESTS must, because
-    a fabric-emulator release republishes those tags over different code.
+    SAIL_ENGINE and SPARK_CLIENT move their digest and _RELEASE on every
+    release, and their _VERSION to whatever dependency that release carries.
     """
     import sys as _sys
 
@@ -69,32 +68,67 @@ def test_a_release_moves_every_digest_with_its_version(tmp_path):
     versions.write_text((ROOT / "versions.env").read_text(encoding="utf-8"),
                         encoding="utf-8")
     fake = "sha256:" + "a" * 64
-    saved = (set_release.VERSIONS, set_release.digest_of, _sys.argv)
+    resolved = []
+    # A release that bumped both dependencies, with pysail pinned twice the way
+    # fabric-emulator's pyproject.toml really does.
+    pyproject = ('dependencies = ["pysail==8.8.8", "pyspark-client==7.7.7"]\n'
+                 'engine = ["pysail==8.8.8"]\n')
+    saved = (set_release.VERSIONS, set_release.digest_of, set_release.fetch, _sys.argv)
     try:
         set_release.VERSIONS = versions
-        set_release.digest_of = lambda image, tag: fake
+        set_release.digest_of = lambda image, tag: resolved.append((image, tag)) or fake
+        set_release.fetch = lambda url: pyproject if "/v9.9.9/" in url else ""
         _sys.argv = ["set_release.py", "9.9.9"]
         assert set_release.main() == 0
     finally:
-        set_release.VERSIONS, set_release.digest_of, _sys.argv = saved
+        (set_release.VERSIONS, set_release.digest_of,
+         set_release.fetch, _sys.argv) = saved
 
     written = versions.read_text(encoding="utf-8")
     assert re.search(r"^FABRIC_EMULATOR_VERSION=9\.9\.9$", written, re.M)
     for prefix in set_release.PINS:
         assert re.search(rf"^{prefix}_DIGEST={fake}$", written, re.M), (
             f"{prefix} kept a stale digest beside a moved release")
-    # The dependency versions must NOT be dragged to the emulator's number --
-    # and must NOT be asserted as literals either. This used to read
-    # `SAIL_ENGINE_VERSION=0.7.0`, encoding "the Sail engine never moves" as a
-    # constant. fabric-emulator v0.36.0 moved pysail to 0.7.1, the 0.7.0 tag
-    # kept naming the previous build, and this assertion then FAILED the
-    # correct pin. What the release must preserve is whatever was there.
-    before = (ROOT / "versions.env").read_text(encoding="utf-8")
-    for dep in ("SAIL_ENGINE_VERSION", "SPARK_CLIENT_VERSION"):
-        was = re.search(rf"^{dep}=(.+)$", before, re.M).group(1)
-        now = re.search(rf"^{dep}=(.+)$", written, re.M).group(1)
-        assert now == was, f"{dep} moved {was} -> {now}; a release must not touch it"
-        assert now != "9.9.9", f"{dep} was dragged to the emulator's version"
+    # EVERY digest comes from the release's own tag. Resolving the sidecars by
+    # their dependency tag is the bug this replaces: after v0.36.0 moved pysail
+    # to 0.7.1, `emulator-sail:0.7.0` still named v0.35.0's build, and that is
+    # what got pinned under a 0.36.0 label.
+    assert {tag for _, tag in resolved} == {"9.9.9"}, resolved
+    # The dependency versions follow the RELEASE's pins, never the emulator's
+    # number, and never a literal in this test. This used to assert they did
+    # not move at all, which is the belief v0.36.0 disproved.
+    assert re.search(r"^SAIL_ENGINE_VERSION=8\.8\.8$", written, re.M)
+    assert re.search(r"^SPARK_CLIENT_VERSION=7\.7\.7$", written, re.M)
+    for prefix in ("SAIL_ENGINE", "SPARK_CLIENT"):
+        assert re.search(rf"^{prefix}_RELEASE=9\.9\.9$", written, re.M), prefix
+
+
+def test_a_release_with_an_ambiguous_dependency_pin_writes_nothing(tmp_path):
+    """Two different pysail pins means the release cannot say which Sail it
+    shipped. Guessing would pin one of them under a label it may not match."""
+    import sys as _sys
+
+    import pytest
+
+    _sys.path.insert(0, str(ROOT / "scripts"))
+    import set_release
+
+    versions = tmp_path / "versions.env"
+    original = (ROOT / "versions.env").read_text(encoding="utf-8")
+    versions.write_text(original, encoding="utf-8")
+    pyproject = '"pysail==0.7.0"\n"pysail==0.7.1"\n"pyspark-client==4.2.0"\n'
+    saved = (set_release.VERSIONS, set_release.digest_of, set_release.fetch, _sys.argv)
+    try:
+        set_release.VERSIONS = versions
+        set_release.digest_of = lambda image, tag: "sha256:" + "b" * 64
+        set_release.fetch = lambda url: pyproject
+        _sys.argv = ["set_release.py", "9.9.9"]
+        with pytest.raises(SystemExit, match="pysail"):
+            set_release.main()
+    finally:
+        (set_release.VERSIONS, set_release.digest_of,
+         set_release.fetch, _sys.argv) = saved
+    assert versions.read_text(encoding="utf-8") == original
 
 
 def test_every_digest_in_versions_env_is_moved_by_a_release():
