@@ -27,5 +27,20 @@ COPY --chown=airflow ${PRODUCT_DIR}/pyproject.toml /opt/build/pyproject.toml
 # which that user cannot write -- the build fails on `Permission denied`
 # creating a package directory, which reads like a broken wheel rather than a
 # wrong target. uv is already in the image, so it is not installed again.
+# INSTALLED FROM /opt/build, not from an absolute path, and that is the whole
+# fix for a silent one. `uv pip install -r <path>/pyproject.toml` reads the
+# DEPENDENCIES from the file it is given but takes `[tool.uv]` settings from the
+# project it discovers in the WORKING DIRECTORY -- so run anywhere else, a
+# product's `override-dependencies` is read as nothing at all.
+#
+# Measured rather than reasoned about, same file in two places:
+#   cwd holds pyproject.toml   -> sqlparse 0.6.0   (the override applies)
+#   file passed by path        -> sqlparse 0.5.5   (silently ignored)
+#
+# The second is what this image did, so a leaf that overrode a transitive pin
+# to escape four advisories got the vulnerable version anyway, with a green
+# build and a lockfile saying otherwise. Nothing warns; the resolver simply
+# never sees the setting.
+WORKDIR /opt/build
 RUN uv pip install --python /home/airflow/.local/bin/python \
-      -r /opt/build/pyproject.toml
+      -r pyproject.toml
