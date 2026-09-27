@@ -289,7 +289,7 @@ services:
   # A parallel executor needs concurrent writers; SQLite answers
   # `database is locked`, so the database is not a separable choice.
   airflow-db:
-    image: postgres:${POSTGRES_VERSION:?see versions.env}@${POSTGRES_DIGEST:?see versions.env}
+    image: mirror.gcr.io/library/postgres:${POSTGRES_VERSION:?see versions.env}@${POSTGRES_DIGEST:?see versions.env}
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
@@ -303,7 +303,7 @@ services:
   # The queue between scheduler and worker: the part that makes the executor
   # Celery rather than Local.
   airflow-broker:
-    image: redis:${REDIS_VERSION:?see versions.env}@${REDIS_DIGEST:?see versions.env}
+    image: mirror.gcr.io/library/redis:${REDIS_VERSION:?see versions.env}@${REDIS_DIGEST:?see versions.env}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

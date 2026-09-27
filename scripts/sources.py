@@ -83,7 +83,7 @@ def _load(path: pathlib.Path) -> dict:
 
 def _openapi(name: str, v: dict, sources_dir: str, pins: dict) -> dict:
     service = {
-        "image": f"mokapi/mokapi:{pins['MOKAPI_VERSION']}",
+        "image": f"mirror.gcr.io/mokapi/mokapi:{pins['MOKAPI_VERSION']}",
         # The dashboard retains every request AND its response body. For a
         # 170 MB export that is a multi-hundred-MB copy per call, so the
         # history is capped at one entry per API.
@@ -150,7 +150,7 @@ def _cdc(name: str, v: dict, sources_dir: str, pins: dict, interpreter: str) -> 
     user, password, database = v["db_user"], v["db_password"], v["db_name"]
     services = {
         db: {
-            "image": f"postgres:{pins['POSTGRES_VERSION']}",
+            "image": f"mirror.gcr.io/library/postgres:{pins['POSTGRES_VERSION']}",
             # LOGICAL replication, and the slots to hold it. Debezium reads the
             # WAL; at the default `replica` level there is nothing in it for a
             # decoder to read and the connector attaches to silence.
@@ -173,7 +173,7 @@ def _cdc(name: str, v: dict, sources_dir: str, pins: dict, interpreter: str) -> 
                             "interval": "5s", "timeout": "5s", "retries": 30},
         },
         connect: {
-            "image": f"debezium/connect:{pins['DEBEZIUM_VERSION']}",
+            "image": f"mirror.gcr.io/debezium/connect:{pins['DEBEZIUM_VERSION']}",
             "depends_on": {db: {"condition": "service_healthy"},
                            broker: {"condition": "service_healthy"}},
             "environment": {
@@ -201,7 +201,7 @@ def _cdc(name: str, v: dict, sources_dir: str, pins: dict, interpreter: str) -> 
         # it must not loop if the replay fails. It runs the VENDOR'S OWN
         # scripts -- this platform supplies an interpreter and nothing else.
         services[f"{name}-seed"] = {
-            "image": f"python:{interpreter}-slim",
+            "image": f"mirror.gcr.io/library/python:{interpreter}-slim",
             "depends_on": {db: {"condition": "service_healthy"},
                            connect: {"condition": "service_healthy"}},
             "environment": {

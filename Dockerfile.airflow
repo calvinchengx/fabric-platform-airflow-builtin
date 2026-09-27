@@ -19,7 +19,7 @@
 # installing it would suggest a delivery mechanism this cell does not use.
 # If a leaf here ever ships importable code, this is the line to revisit.
 ARG AIRFLOW_VERSION=2.10.5-python3.12
-FROM apache/airflow:${AIRFLOW_VERSION}
+FROM mirror.gcr.io/apache/airflow:${AIRFLOW_VERSION}
 ARG PRODUCT_DIR=product
 COPY --chown=airflow ${PRODUCT_DIR}/pyproject.toml /opt/build/pyproject.toml
 # --python, NOT --system. The image runs as the `airflow` user and its
