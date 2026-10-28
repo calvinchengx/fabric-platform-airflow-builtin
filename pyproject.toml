@@ -13,7 +13,11 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.16"]
+# RUFF IS BOUNDED ON PURPOSE. 0.16 and 0.17 enable rule sets that flag
+# ~30 existing sites in scripts/; the migration is its own change, so the
+# linter is held here and Dependabot is told to leave the bound alone
+# (.github/dependabot.yml).
+dev = ["pytest>=9.0.3,<10", "ruff>=0.15,<0.16"]
 
 [tool.ruff]
 line-length = 100
